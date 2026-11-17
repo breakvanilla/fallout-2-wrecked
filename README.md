@@ -1,5 +1,7 @@
 # Wrecked Fallout 2
 
+![The beam breaks a brick building](docs/02-beam-breaks-brick-building-corner.gif)
+
 Wrecked Fallout 2 is a Fallout 2 mod where explosions break things. It is a modified version of [Fallout 2 Community Edition](https://github.com/alexbatalov/fallout2-ce) (fallout2-ce) for Windows and macOS. You need your own copy of the game; this repository has no game files.
 
 - Grenades, rockets and dynamite blow holes in walls, knock down scenery and break through roofs.
@@ -10,6 +12,14 @@ Wrecked Fallout 2 is a Fallout 2 mod where explosions break things. It is a modi
 - G drops a meteor on the cursor; it breaks more, and wider, than any explosion.
 
 The beam and the meteor are the game's own explosions: they throw people back and hurt everyone near, the player too.
+
+## In action
+
+<table>
+<tr><td><img src="docs/01-meteors-smash-wooden-shacks.gif" width="100%" alt="Meteors smash wooden shacks"><br>Meteors smash wooden shacks</td><td><img src="docs/05-beam-and-meteor-break-roof-from-above.gif" width="100%" alt="Roofs break from above"><br>Roofs break from above</td></tr>
+<tr><td><img src="docs/06-meteor-blows-apart-house-in-woods.gif" width="100%" alt="A house in the woods blown apart"><br>A house in the woods blown apart</td><td><img src="docs/03-beam-hits-wooden-house.gif" width="100%" alt="The beam burns a wooden house"><br>The beam burns a wooden house</td></tr>
+<tr><td><img src="docs/04-beam-hits-brahmin-pen.gif" width="100%" alt="The beam hits the brahmin pen"><br>The beam hits the brahmin pen</td><td><img src="docs/07-meteors-hit-geckos-in-wasteland.gif" width="100%" alt="Meteors vs geckos"><br>Meteors vs geckos</td></tr>
+</table>
 
 Website: [breakvanilla.com](https://breakvanilla.com/). Videos: [youtube.com/@BreakVanilla](https://www.youtube.com/@BreakVanilla).
 

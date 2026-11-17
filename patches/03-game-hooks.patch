@@ -1,5 +1,5 @@
 diff --git a/src/actions.cc b/src/actions.cc
-index 99ded11f7a085f955524ff19b1e568955b1352b3..bd111bffb18efba4723b140e48a81a5c553de0b8 100644
+index 99ded11f7a085f955524ff19b1e568955b1352b3..1bee8f1c363f49eed2a24dbace82a16a7c9cc9be 100644
 --- a/src/actions.cc
 +++ b/src/actions.cc
 @@ -11,6 +11,7 @@
@@ -29,7 +29,27 @@ index 99ded11f7a085f955524ff19b1e568955b1352b3..bd111bffb18efba4723b140e48a81a5c
  
                          // SFALL
                          if (explosionEmitsLight()) {
-@@ -1661,7 +1672,7 @@ int actionExplode(int tile, int elevation, int minDamage, int maxDamage, Object*
+@@ -1640,7 +1651,8 @@ int actionExplode(int tile, int elevation, int minDamage, int maxDamage, Object*
+         if (reg_anim_clear(critter) == -2) {
+             debugPrint("Cannot clear target's animation for action_explode!\n");
+         }
+-        attack->defenderDamage = _compute_explosion_damage(minDamage, maxDamage, critter, &(attack->defenderKnockback));
++        int percent = destructBlastPercent(tile, critter->tile);
++        attack->defenderDamage = _compute_explosion_damage(minDamage * percent / 100, maxDamage * percent / 100, critter, &(attack->defenderKnockback));
+     }
+ 
+     _compute_explosion_on_extras(attack, 0, 0, 1);
+@@ -1651,7 +1663,8 @@ int actionExplode(int tile, int elevation, int minDamage, int maxDamage, Object*
+             debugPrint("Cannot clear extra's animation for action_explode!\n");
+         }
+ 
+-        attack->extrasDamage[index] = _compute_explosion_damage(minDamage, maxDamage, critter, &(attack->extrasKnockback[index]));
++        int percent = destructBlastPercent(tile, critter->tile);
++        attack->extrasDamage[index] = _compute_explosion_damage(minDamage * percent / 100, maxDamage * percent / 100, critter, &(attack->extrasKnockback[index]));
+     }
+ 
+     attackComputeDeathFlags(attack);
+@@ -1661,7 +1674,7 @@ int actionExplode(int tile, int elevation, int minDamage, int maxDamage, Object*
  
          reg_anim_begin(ANIMATION_REQUEST_RESERVED);
          _register_priority(1);
@@ -38,7 +58,7 @@ index 99ded11f7a085f955524ff19b1e568955b1352b3..bd111bffb18efba4723b140e48a81a5c
          animationRegisterUnsetFlag(explosion, OBJECT_HIDDEN, 0);
          animationRegisterAnimateAndHide(explosion, ANIM_STAND, 0);
          _show_damage(attack, 0, 1);
-@@ -1713,6 +1724,8 @@ int actionExplode(int tile, int elevation, int minDamage, int maxDamage, Object*
+@@ -1713,6 +1726,8 @@ int actionExplode(int tile, int elevation, int minDamage, int maxDamage, Object*
  
          _combat_explode_scenery(explosion, nullptr);
  
@@ -48,7 +68,7 @@ index 99ded11f7a085f955524ff19b1e568955b1352b3..bd111bffb18efba4723b140e48a81a5c
  
          for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
 diff --git a/src/animation.cc b/src/animation.cc
-index 0884eb28815718b6e29877db50cf0f424acc6c31..a8f5100b3a70ff204fc1b39f261da1f8ab58f276 100644
+index 0884eb28815718b6e29877db50cf0f424acc6c31..18701b56f3f1c46d84a05587796d1bdf8ced958a 100644
 --- a/src/animation.cc
 +++ b/src/animation.cc
 @@ -9,6 +9,7 @@
@@ -67,6 +87,15 @@ index 0884eb28815718b6e29877db50cf0f424acc6c31..a8f5100b3a70ff204fc1b39f261da1f8
  static int animationRunSequence(int a1);
  static int _anim_set_continue(int a1, int a2);
  static int _anim_set_end(int a1);
+@@ -483,7 +485,7 @@ int reg_anim_end()
+     animationSequence->animationIndex = -1;
+     animationSequence->flags &= ~ANIM_SEQ_ACCUMULATING;
+     animationSequence->animations[0].delay = 0;
+-    if (isInCombat()) {
++    if (isInCombat() || combatAttackOutside()) {
+         _combat_anim_begin();
+         animationSequence->flags |= ANIM_SEQ_COMBAT_ANIM_STARTED;
+     }
 @@ -535,6 +537,10 @@ static void _anim_cleanup()
          if (animationDescription->kind == ANIM_KIND_CALLBACK && animationDescription->callback == (AnimationCallback*)_gsnd_anim_sound) {
              soundEffectDelete((Sound*)animationDescription->param1);
@@ -148,6 +177,183 @@ index b5293a02752a29cf09eee4807363445482e879cd..0b98a6eaed131860265a2761efa5f867
  int animationRegisterCallback3(void* a1, void* a2, void* a3, AnimationCallback3* proc, int delay);
  int animationRegisterCallbackForced(void* a1, void* a2, AnimationCallback* proc, int delay);
  int animationRegisterSetFlag(Object* object, int flag, int delay);
+diff --git a/src/audio_engine.cc b/src/audio_engine.cc
+index 6523c5cfd438a5996451bce62e0879c40ad94181..30b7d439190a5d001d06c03842c7eec3090944e5 100644
+--- a/src/audio_engine.cc
++++ b/src/audio_engine.cc
+@@ -8,7 +8,9 @@
+ 
+ namespace fallout {
+ 
+-#define AUDIO_ENGINE_SOUND_BUFFERS 8
++// Wrecked Fallout 2: room for every sound effect at once, with music,
++// ambient sounds and speech.
++#define AUDIO_ENGINE_SOUND_BUFFERS 32
+ 
+ struct AudioEngineSoundBuffer {
+     bool active;
+diff --git a/src/cache.cc b/src/cache.cc
+index 3893e21ea5aecbf281d52701330b8bdec2474744..607931361cbb56543d54e65191d70aa60f4f6960 100644
+--- a/src/cache.cc
++++ b/src/cache.cc
+@@ -355,10 +355,12 @@ static int cacheFindIndexForKey(Cache* cache, int key, int* indexPtr)
+             return 2;
+         }
+ 
++        // Wrecked Fallout 2: halves the range, so that drawing the whole map
++        // window every frame stays fast.
+         if (cmp > 0) {
+-            l = l + 1;
++            l = mid + 1;
+         } else {
+-            r = r - 1;
++            r = mid - 1;
+         }
+     } while (r >= l);
+ 
+diff --git a/src/combat.cc b/src/combat.cc
+index 825a57343fe68b3870df43e098a3d8a2f722b843..600aeedd27b3ac2894478dbd24278aa88433eb97 100644
+--- a/src/combat.cc
++++ b/src/combat.cc
+@@ -12,6 +12,7 @@
+ #include "critter.h"
+ #include "db.h"
+ #include "debug.h"
++#include "destruct.h"
+ #include "display_monitor.h"
+ #include "draw.h"
+ #include "elevator.h"
+@@ -1953,6 +1954,9 @@ static int _list_com;
+ // 0x56D398
+ static int _combat_exps;
+ 
++// The player's attack outside combat is being set up.
++static bool gCombatAttackOutside = false;
++
+ // bonus action points from BONUS_MOVE perk.
+ //
+ // 0x56D39C
+@@ -2098,9 +2102,9 @@ int combatLoad(File* stream)
+         Object* obj = objectFindFirst();
+         while (obj != nullptr) {
+             if (PID_TYPE(obj->pid) == OBJ_TYPE_CRITTER) {
+-                if (obj->data.critter.combat.whoHitMeCid == -1) {
+-                    obj->data.critter.combat.whoHitMe = nullptr;
+-                }
++                // Wrecked Fallout 2: an attacker kept as an id is no object
++                // outside combat, and a death outside combat reads it.
++                obj->data.critter.combat.whoHitMe = nullptr;
+             }
+             obj = objectFindNext();
+         }
+@@ -3377,6 +3381,17 @@ static bool _combat_should_end()
+ // 0x422D2C
+ void _combat(CombatStartData* csd)
+ {
++    // Peaceful: no combat starts; a save made in combat still goes on with it.
++    if (destructPeaceful() && (gCombatState & COMBAT_STATE_0x01) == 0) {
++#ifdef WRECKED_TEST
++        fprintf(stderr, "destruct: combat blocked\n");
++#endif
++        return;
++    }
++#ifdef WRECKED_TEST
++    fprintf(stderr, "destruct: combat starts\n");
++#endif
++
+     ScopedGameMode gm(GameMode::kCombat);
+ 
+     if (csd == nullptr
+@@ -5362,6 +5377,11 @@ void _combat_anim_finished()
+ 
+         _apply_damage(&_main_ctd, true);
+ 
++        if (!isInCombat() && _combat_exps != 0) {
++            _combat_give_exps(_combat_exps);
++            _combat_exps = 0;
++        }
++
+         Object* attacker = _main_ctd.attacker;
+         if (attacker == gDude && _combat_highlight == 2) {
+             _combat_outline_on();
+@@ -5711,6 +5731,24 @@ bool _combat_to_hit(Object* target, int* accuracy)
+     return true;
+ }
+ 
++// The player's attack; `outside` runs it at once, outside combat.
++static void combatDudeAttack(Object* target, int hitMode, int hitLocation, bool outside)
++{
++    gCombatAttackOutside = outside;
++    _combat_attack(gDude, target, hitMode, hitLocation);
++    gCombatAttackOutside = false;
++
++    if (outside) {
++        gDude->data.critter.combat.ap = critterGetStat(gDude, STAT_MAXIMUM_ACTION_POINTS);
++        interfaceRenderActionPoints(0, 0);
++    }
++}
++
++bool combatAttackOutside()
++{
++    return gCombatAttackOutside;
++}
++
+ // 0x4267CC
+ void _combat_attack_this(Object* target)
+ {
+@@ -5728,6 +5766,11 @@ void _combat_attack_this(Object* target)
+         return;
+     }
+ 
++    bool outside = !isInCombat() && destructPeaceful();
++    if (outside) {
++        gDude->data.critter.combat.ap = critterGetStat(gDude, STAT_MAXIMUM_ACTION_POINTS);
++    }
++
+     MessageListItem messageListItem;
+     Object* item;
+     char formattedText[80];
+@@ -5782,7 +5825,7 @@ void _combat_attack_this(Object* target)
+         return;
+     }
+ 
+-    if (!isInCombat()) {
++    if (!isInCombat() && !outside) {
+         CombatStartData combat;
+         combat.attacker = gDude;
+         combat.defender = target;
+@@ -5797,7 +5840,7 @@ void _combat_attack_this(Object* target)
+     }
+ 
+     if (!aiming) {
+-        _combat_attack(gDude, target, hitMode, HIT_LOCATION_UNCALLED);
++        combatDudeAttack(target, hitMode, HIT_LOCATION_UNCALLED, outside);
+         return;
+     }
+ 
+@@ -5807,7 +5850,7 @@ void _combat_attack_this(Object* target)
+ 
+     int hitLocation;
+     if (calledShotSelectHitLocation(target, &hitLocation, hitMode) != -1) {
+-        _combat_attack(gDude, target, hitMode, hitLocation);
++        combatDudeAttack(target, hitMode, hitLocation, outside);
+     }
+ }
+ 
+diff --git a/src/combat.h b/src/combat.h
+index 7935844b9cc9f77284952108f45d2e0c1a06b764..a9a03f61a6f0c2448a7dab8afc4d519fc36a47a0 100644
+--- a/src/combat.h
++++ b/src/combat.h
+@@ -49,6 +49,9 @@ void _combat_anim_finished();
+ int _combat_check_bad_shot(Object* attacker, Object* defender, int hitMode, bool aiming);
+ bool _combat_to_hit(Object* target, int* accuracy);
+ void _combat_attack_this(Object* target);
++// The player's attack outside combat is being set up: its animations apply
++// its damage as in combat.
++bool combatAttackOutside();
+ void _combat_outline_on();
+ void _combat_outline_off();
+ void _combat_highlight_change();
 diff --git a/src/game.cc b/src/game.cc
 index 978a3859cdf3cb7cbf4c4feffbd203a430afe26b..764ded03a84940c722fabbf6a3099a9b2fd6bfa2 100644
 --- a/src/game.cc
@@ -274,7 +480,7 @@ index 567548e4a2f7a666b2f67f49b66780d925b1b270..d11f8aefc35afc9904565cf6ea80a1a9
  
  #endif /* LOAD_SAVE_GAME_H */
 diff --git a/src/map.cc b/src/map.cc
-index e73109f0ef43da204ce93c0e3a202a34c483bbd9..3fbbadc6dfb14df1572db8d3ef1737234e2cbfca 100644
+index e73109f0ef43da204ce93c0e3a202a34c483bbd9..c581fd9bddc32c04aaf88aa399d220a113b0553d 100644
 --- a/src/map.cc
 +++ b/src/map.cc
 @@ -18,6 +18,7 @@
@@ -285,7 +491,15 @@ index e73109f0ef43da204ce93c0e3a202a34c483bbd9..3fbbadc6dfb14df1572db8d3ef173723
  #include "game_movie.h"
  #include "game_sound.h"
  #include "input.h"
-@@ -197,6 +198,8 @@ int isoInit()
+@@ -49,6 +50,7 @@ static char* mapBuildPath(char* name);
+ static int mapLoad(File* stream);
+ static int _map_age_dead_critters();
+ static void _map_fix_critter_combat_data();
++static void mapForgetWhoHitMe();
+ static int _map_save();
+ static int _map_save_file(File* stream);
+ static void mapMakeMapsDirectory();
+@@ -197,6 +199,8 @@ int isoInit()
          return -1;
      }
  
@@ -294,7 +508,7 @@ index e73109f0ef43da204ce93c0e3a202a34c483bbd9..3fbbadc6dfb14df1572db8d3ef173723
      if (artInit() != 0) {
          debugPrint("art_init failed in iso_init\n");
          return -1;
-@@ -270,6 +273,7 @@ void isoExit()
+@@ -270,6 +274,7 @@ void isoExit()
      tileExit();
      artExit();
  
@@ -302,7 +516,7 @@ index e73109f0ef43da204ce93c0e3a202a34c483bbd9..3fbbadc6dfb14df1572db8d3ef173723
      windowDestroy(gIsoWindow);
  
      // NOTE: Uninline.
-@@ -738,6 +742,7 @@ void mapNewMap()
+@@ -738,6 +743,7 @@ void mapNewMap()
      gMapHeader.enteringTile = 20100;
      _obj_remove_all();
      animationStop();
@@ -310,7 +524,16 @@ index e73109f0ef43da204ce93c0e3a202a34c483bbd9..3fbbadc6dfb14df1572db8d3ef173723
  
      // NOTE: Uninline.
      mapGlobalVariablesFree();
-@@ -992,6 +997,7 @@ err:
+@@ -912,6 +918,8 @@ static int mapLoad(File* stream)
+ 
+     if ((gMapHeader.flags & 1) == 0) {
+         _map_fix_critter_combat_data();
++    } else if (!_isLoadingGame()) {
++        mapForgetWhoHitMe();
+     }
+ 
+     error = "Error setting map elevation";
+@@ -992,6 +1000,7 @@ err:
          rc = -1;
      } else {
          _obj_preload_art_cache(gMapHeader.flags);
@@ -318,7 +541,26 @@ index e73109f0ef43da204ce93c0e3a202a34c483bbd9..3fbbadc6dfb14df1572db8d3ef173723
      }
  
      _partyMemberRecoverLoad();
-@@ -1456,6 +1462,7 @@ int _map_save_in_game(bool a1)
+@@ -1304,6 +1313,18 @@ static void _map_fix_critter_combat_data()
+     }
+ }
+ 
++// Wrecked Fallout 2: a map saved when the player left it keeps each critter's
++// attacker as an id, which is no object outside combat; a death outside
++// combat reads it.
++static void mapForgetWhoHitMe()
++{
++    for (Object* object = objectFindFirst(); object != nullptr; object = objectFindNext()) {
++        if (object->pid != -1 && PID_TYPE(object->pid) == OBJ_TYPE_CRITTER) {
++            object->data.critter.combat.whoHitMe = nullptr;
++        }
++    }
++}
++
+ // map_save
+ // 0x483850
+ static int _map_save()
+@@ -1456,6 +1477,7 @@ int _map_save_in_game(bool a1)
      if (a1 && !wmMapIsSaveable()) {
          debugPrint("\nNot saving RANDOM encounter map.");
  
@@ -427,6 +669,21 @@ index 20b7aeffe1f58b947f2885f1ecd751cb41737c9f..a4ae94af99ccd573304007e3fad0bad8
      unsigned char* src2 = src;
      int v50 = objectRect.left - object->sx;
      int v49 = objectRect.top - object->sy;
+diff --git a/src/sound_effects_cache.h b/src/sound_effects_cache.h
+index 483cb86b4d9fc2bd9c0ab1fe467afa27646fda65..e67d7a9c19306b5065d4b35a5d3db8d39579454f 100644
+--- a/src/sound_effects_cache.h
++++ b/src/sound_effects_cache.h
+@@ -5,7 +5,9 @@ namespace fallout {
+ 
+ // The maximum number of sound effects that can be loaded and played
+ // simultaneously.
+-#define SOUND_EFFECTS_MAX_COUNT (4)
++// Wrecked Fallout 2: blasts, the beam and the meteor play several sounds at
++// once, on top of the deaths they cause.
++#define SOUND_EFFECTS_MAX_COUNT (16)
+ 
+ int soundEffectsCacheInit(int cache_size, const char* effectsPath);
+ void soundEffectsCacheExit();
 diff --git a/src/svga.cc b/src/svga.cc
 index 8acca9665e27a8d53276b39c9a5614301d58b9b9..625d8b2b5c9bdafd7c6d3a33bb787732939406b5 100644
 --- a/src/svga.cc

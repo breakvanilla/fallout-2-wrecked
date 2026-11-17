@@ -101,7 +101,7 @@ WRECKED_TEST_SLOT=1 wrecked/test_run.sh met1 DESTRUCT_TEST_METEOR=-206
 WRECKED_TEST_SLOT=3 wrecked/test_run.sh aim1 DESTRUCT_TEST_AIM=150,280
 ```
 
-- `DESTRUCT_WEAR=1 DESTRUCT_ADD_ITEMS=14:60 DESTRUCT_RESAVE=Name`, with `WRECKED_TEST_SLOT`, puts on leather armor, adds 60 explosive rockets and saves the slot again as Name.
+- `DESTRUCT_WEAR=1 DESTRUCT_ADD_ITEMS=14:60 DESTRUCT_RESAVE=Name`, with `WRECKED_TEST_SLOT`, puts on leather armor, adds 60 explosive rockets and saves the slot again as Name. With it, `DESTRUCT_STRENGTH=10`, `DESTRUCT_LEVEL=12` and `DESTRUCT_HP=500` raise the player's Strength, level and hit points, and `DESTRUCT_WIELD=13:14` loads a rocket launcher from the inventory's rockets and puts it in the right hand. `DESTRUCT_LIST=1` also prints the player's level, hit points, Strength, carried weight and inventory; `DESTRUCT_TEST_THROW` throws the player's own item when the inventory has one.
 - `ARCH=x86_64` runs the Intel half of the test build under Rosetta; `BUILD=` runs another build folder.
 
 ## Licence

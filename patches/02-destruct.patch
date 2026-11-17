@@ -1,9 +1,9 @@
 diff --git a/src/destruct.cc b/src/destruct.cc
 new file mode 100644
-index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e639d50f8
+index 0000000000000000000000000000000000000000..d222e611147db92f8063a852aa121249fe3f7e9f
 --- /dev/null
 +++ b/src/destruct.cc
-@@ -0,0 +1,4290 @@
+@@ -0,0 +1,4410 @@
 +#include "destruct.h"
 +
 +#include <math.h>
@@ -29,6 +29,7 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +#include "game.h"
 +#include "game_sound.h"
 +#include "input.h"
++#include "item.h"
 +#include "light.h"
 +#include "map.h"
 +#include "mouse.h"
@@ -182,6 +183,8 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +    bool beam = true;
 +    // G drops a meteor at the cursor.
 +    bool meteor = true;
++    // Nobody turns on the player and no combat starts.
++    bool peaceful = false;
 +    int wallStrength = 30;
 +    int sceneryStrength = 10;
 +    // Percent of the usual amount of flying debris.
@@ -243,6 +246,10 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +static std::vector<Particle> gParticles;
 +// Particles by ground tile, for one pass of the map renderer.
 +static std::vector<std::pair<int, int>> gParticleOrder;
++// The order is made again only after pieces move or come and go, not for
++// every part of the window that is drawn.
++static bool gParticleOrderDirty = true;
++static int gParticleOrderElevation = -1;
 +static std::unordered_map<std::string, std::vector<Decal>> gDestructDecals;
 +static std::string gDestructMap;
 +static std::unordered_map<std::string, std::vector<Damage>> gDestructDamage;
@@ -387,7 +394,10 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +        return;
 +    }
 +
-+    if (configRead(&config, "wrecked-fallout-2/wrecked.ini", false)) {
++    bool read = configRead(&config, "wrecked-fallout-2/wrecked.ini", false);
++    // A wrecked.ini in the game folder overrides any of these settings.
++    read = configRead(&config, "wrecked.ini", false) || read;
++    if (read) {
 +        configGetBool(&config, "wrecked", "enabled", &(gDestructConfig.enabled));
 +        configGetBool(&config, "wrecked", "walls", &(gDestructConfig.walls));
 +        configGetBool(&config, "wrecked", "scenery", &(gDestructConfig.scenery));
@@ -397,6 +407,7 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +        configGetBool(&config, "wrecked", "test_key", &(gDestructConfig.testKey));
 +        configGetBool(&config, "wrecked", "beam", &(gDestructConfig.beam));
 +        configGetBool(&config, "wrecked", "meteor", &(gDestructConfig.meteor));
++        configGetBool(&config, "wrecked", "peaceful", &(gDestructConfig.peaceful));
 +        configGetInt(&config, "wrecked", "wall_strength", &(gDestructConfig.wallStrength));
 +        configGetInt(&config, "wrecked", "scenery_strength", &(gDestructConfig.sceneryStrength));
 +        configGetInt(&config, "wrecked", "debris", &(gDestructConfig.debris));
@@ -1130,18 +1141,23 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +
 +bool destructHasParticles(int elevation)
 +{
-+    gParticleOrder.clear();
 +    if (!gDestructInitialized) {
++        gParticleOrder.clear();
 +        return false;
 +    }
 +
-+    for (size_t index = 0; index < gParticles.size(); index++) {
-+        const Particle& particle = gParticles[index];
-+        if (particle.elevation == elevation && particle.delay <= 0.0f && !particle.dead && particle.tile != -1) {
-+            gParticleOrder.push_back({ particle.tile, (int)index });
++    if (gParticleOrderDirty || gParticleOrderElevation != elevation) {
++        gParticleOrder.clear();
++        for (size_t index = 0; index < gParticles.size(); index++) {
++            const Particle& particle = gParticles[index];
++            if (particle.elevation == elevation && particle.delay <= 0.0f && !particle.dead && particle.tile != -1) {
++                gParticleOrder.push_back({ particle.tile, (int)index });
++            }
 +        }
++        std::sort(gParticleOrder.begin(), gParticleOrder.end());
++        gParticleOrderDirty = false;
++        gParticleOrderElevation = elevation;
 +    }
-+    std::sort(gParticleOrder.begin(), gParticleOrder.end());
 +    return !gParticleOrder.empty();
 +}
 +
@@ -1282,6 +1298,7 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +        return;
 +    }
 +    gParticles.push_back(std::move(particle));
++    gParticleOrderDirty = true;
 +}
 +
 +static void destructLaunch(Particle* particle, float fromX, float fromY, float speed, float lift)
@@ -2269,6 +2286,25 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +}
 +
 +// Breaks scenery and walls in reach and returns the area to redraw.
++// Whether a wall that still blocks stands within two hexes of `tile`.
++static bool destructWallBeside(int tile, int elevation)
++{
++    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
++        for (int step = 1; step <= 2; step++) {
++            int other = tileGetTileInDirection(tile, rotation, step);
++            if (!tileIsValid(other)) {
++                continue;
++            }
++            for (Object* object = objectFindFirstAtLocation(elevation, other); object != nullptr; object = objectFindNextAtLocation()) {
++                if (FID_TYPE(object->fid) == OBJ_TYPE_WALL && (object->flags & (OBJECT_HIDDEN | OBJECT_NO_BLOCK)) == 0) {
++                    return true;
++                }
++            }
++        }
++    }
++    return false;
++}
++
 +static void destructBreak(int tile, int elevation, int radius, int damage, float power, Rect* dirty, bool* anyDirty)
 +{
 +    if (destructMapBlocked() || (!gDestructConfig.walls && !gDestructConfig.scenery)) {
@@ -2330,9 +2366,11 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +    // A wall came down: the roof over it goes too.
 +    bool roofFall = false;
 +
++    // Doors, after the walls: whether one still stands beside them.
++    std::vector<Object*> doors;
 +    for (Object* object : candidates) {
 +        int type = FID_TYPE(object->fid);
-+        if (object->elevation != elevation || object->sid != -1 || (object->flags & OBJECT_HIDDEN) != 0 || object == gDude) {
++        if (object->elevation != elevation || (object->flags & OBJECT_HIDDEN) != 0 || object == gDude) {
 +            continue;
 +        }
 +
@@ -2342,12 +2380,20 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +            continue;
 +        }
 +        if (wall) {
-+            if (!gDestructConfig.walls || PID_TYPE(object->pid) != OBJ_TYPE_WALL) {
++            if (!gDestructConfig.walls || object->sid != -1 || PID_TYPE(object->pid) != OBJ_TYPE_WALL) {
 +                continue;
 +            }
 +        } else if (type == OBJ_TYPE_SCENERY) {
 +            Proto* proto;
-+            if (!gDestructConfig.scenery || PID_TYPE(object->pid) != OBJ_TYPE_SCENERY || protoGetProto(object->pid, &proto) == -1 || proto->scenery.type != SCENERY_TYPE_GENERIC) {
++            if (!gDestructConfig.scenery || PID_TYPE(object->pid) != OBJ_TYPE_SCENERY || protoGetProto(object->pid, &proto) == -1) {
++                continue;
++            }
++            // Doors keep their scripts, so they are only hidden: see below.
++            if (proto->scenery.type == SCENERY_TYPE_DOOR) {
++                doors.push_back(object);
++                continue;
++            }
++            if (object->sid != -1 || proto->scenery.type != SCENERY_TYPE_GENERIC) {
 +                continue;
 +            }
 +        } else {
@@ -2453,6 +2499,49 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +            rectUnion(dirty, &objectRect, dirty);
 +        } else {
 +            *dirty = objectRect;
++            *anyDirty = true;
++        }
++    }
++
++    // A door goes whole when it is hit hard, when a wall breaks in the same
++    // blast, or when no wall is left beside it to hold it up.
++    for (Object* door : doors) {
++        DestructFrame frame;
++        if (!destructObjectFrame(door, &frame) || frame.width * frame.height > 170 * 170) {
++            continue;
++        }
++        int distance = tileDistanceBetween(tile, door->tile);
++        int received = damage * (radius + 1 - distance) / (radius + 1);
++        int strength = gDestructConfig.sceneryStrength + frame.width * frame.height / 250;
++        bool alone = !destructWallBeside(door->tile, elevation);
++#ifdef WRECKED_TEST
++        fprintf(stderr, "destruct: door %08x at %d (distance %d, %d against %d, wall broken %d, alone %d)\n", door->fid, door->tile, distance, received, strength, wallBroken ? 1 : 0, alone ? 1 : 0);
++#endif
++        if (received < strength && !wallBroken && !alone) {
++            continue;
++        }
++
++        unsigned char colors[8];
++        destructFrameColors(frame, colors);
++        DestructMaterial material = destructObjectMaterial(door);
++        float push = power * (radius + 1 - distance) / (radius + 1) + 0.4f;
++        destructShatter(frame, tile, elevation, 0.0f, 0.0f, push, false, material);
++        destructMaterialDebris(frame, tile, elevation, push, colors, material);
++        destructPile(frame, door->tile, elevation, colors, material);
++        destructDust(tile, elevation, frame, blastX, blastY, colors, destructDustCount(material, 3));
++        destructForgetDamage(door);
++
++        Rect doorRect = { frame.left, frame.top, frame.left + frame.width - 1, frame.top + frame.height - 1 };
++        reg_anim_clear(door);
++        Rect hiddenRect;
++        if (objectHide(door, &hiddenRect) == 0) {
++            rectUnion(&doorRect, &hiddenRect, &doorRect);
++        }
++        door->flags |= OBJECT_NO_BLOCK | OBJECT_SHOOT_THRU | OBJECT_LIGHT_THRU;
++        if (*anyDirty) {
++            rectUnion(dirty, &doorRect, dirty);
++        } else {
++            *dirty = doorRect;
 +            *anyDirty = true;
 +        }
 +    }
@@ -2678,6 +2767,17 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +    return pending;
 +}
 +
++int destructBlastPercent(int tile, int targetTile)
++{
++    if (!gBlastMeteor) {
++        return 100;
++    }
++    // A meteor kills whoever it lands on and hurts less further out.
++    static const int kPercent[] = { 300, 220, 150, 100, 60 };
++    int distance = tileDistanceBetween(tile, targetTile);
++    return distance < 5 ? kPercent[distance] : 0;
++}
++
 +int destructExplodeCallback(void* data, void* unused)
 +{
 +    PendingBlast* pending = (PendingBlast*)data;
@@ -2828,11 +2928,14 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +        int tile = gMeteorImpactTile;
 +        gMeteorImpactTile = -1;
 +        if (gMeteorImpactElevation == gElevation) {
-+            // As the game's explosion, so that it throws people back.
++            // As the game's explosion, so that it throws people back; it
++            // hurts within the four hexes it breaks.
 +            gBlastMeteor = true;
++            explosionSetRadius(4);
 +            if (actionExplode(tile, gMeteorImpactElevation, 40, 80, gDude, true) == -2) {
 +                gMeteorImpactTile = tile;
 +            }
++            explosionSetRadius(-1);
 +            gBlastMeteor = false;
 +        }
 +    }
@@ -3789,6 +3892,7 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +        return particle.dead;
 +    }),
 +        gParticles.end());
++    gParticleOrderDirty = true;
 +
 +    if (gBeam.active) {
 +        destructBeamStep(dt, &dirty, &anyDirty);
@@ -3817,6 +3921,7 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +{
 +    gParticles.clear();
 +    gParticleOrder.clear();
++    gParticleOrderDirty = true;
 +    gFlashTile = -1;
 +    gFlashDirty = false;
 +    gShakeAmplitude = 0.0f;
@@ -4217,7 +4322,17 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +    fileClose(stream);
 +}
 +
++bool destructPeaceful()
++{
++    return gDestructConfig.enabled && gDestructConfig.peaceful;
++}
++
 +#ifdef WRECKED_TEST
++void destructTestSetPeaceful(bool peaceful)
++{
++    gDestructConfig.peaceful = peaceful;
++}
++
 +bool destructTestSnapshot(const char* path)
 +{
 +    if (gDestructBuffer == nullptr) {
@@ -4291,15 +4406,20 @@ index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e
 +    auto it = gDestructDecals.find(gDestructMap);
 +    return it != gDestructDecals.end() ? (int)it->second.size() : 0;
 +}
++
++int destructTestParticleCount()
++{
++    return (int)gParticles.size();
++}
 +#endif
 +
 +} // namespace fallout
 diff --git a/src/destruct.h b/src/destruct.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..a79b84ecc70f6a1659bf1d9b3cb83a6bf7303167
+index 0000000000000000000000000000000000000000..7ddf81883954ed07af7e94403f009b67efc9f053
 --- /dev/null
 +++ b/src/destruct.h
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,80 @@
 +#ifndef FALLOUT_DESTRUCT_H_
 +#define FALLOUT_DESTRUCT_H_
 +
@@ -4334,6 +4454,9 @@ index 0000000000000000000000000000000000000000..a79b84ecc70f6a1659bf1d9b3cb83a6b
 +// The same as an animation callback: `data` from `destructPrepare`.
 +void* destructPrepare(int tile, int elevation, int radius, int damage, DestructBlast blast);
 +int destructExplodeCallback(void* data, void* unused);
++// Percent of a game explosion's damage at `targetTile`, from the centre at
++// `tile`: more than 100 near a meteor.
++int destructBlastPercent(int tile, int targetTile);
 +// From the test key: a beam from orbit at the mouse cursor, or a plain
 +// explosion there when the beam is off in the settings.
 +void destructExplodeAtCursor();
@@ -4363,9 +4486,14 @@ index 0000000000000000000000000000000000000000..a79b84ecc70f6a1659bf1d9b3cb83a6b
 +// How far the presented screen is shaken, in screen pixels.
 +void destructShakeOffset(int* x, int* y);
 +
++// No combat starts and the player's attacks run in real time.
++bool destructPeaceful();
++
 +#ifdef WRECKED_TEST
++void destructTestSetPeaceful(bool peaceful);
 +bool destructTestSnapshot(const char* path);
 +int destructTestDecalCount();
++int destructTestParticleCount();
 +void destructTestDumpDamage(const char* directory);
 +#endif
 +

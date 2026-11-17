@@ -1,11 +1,12 @@
 diff --git a/src/main.cc b/src/main.cc
-index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a369260beb7d84 100644
+index ee67a0a437476a82e4a9b4483aef5607a8437e3d..b69f933446bf7f67da28e0850a6ede88fceeffb8 100644
 --- a/src/main.cc
 +++ b/src/main.cc
-@@ -3,21 +3,31 @@
+@@ -3,21 +3,33 @@
  #include <limits.h>
  #include <string.h>
  
++#include <algorithm>
 +#include <string>
 +
 +#include "actions.h"
@@ -29,12 +30,13 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a36926
  #include "game_movie.h"
  #include "game_sound.h"
  #include "input.h"
++#include "interface.h"
 +#include "inventory.h"
 +#include "item.h"
  #include "kb.h"
  #include "loadsave.h"
  #include "mainmenu.h"
-@@ -33,6 +43,7 @@
+@@ -33,6 +45,7 @@
  #include "settings.h"
  #include "sfall_config.h"
  #include "sfall_global_scripts.h"
@@ -42,11 +44,23 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a36926
  #include "svga.h"
  #include "text_font.h"
  #include "window.h"
-@@ -70,9 +81,37 @@ static bool _main_show_death_scene = false;
+@@ -70,9 +83,49 @@ static bool _main_show_death_scene = false;
  // 0x614838
  static bool _main_death_voiceover_done;
  
 +#ifdef WRECKED_TEST
++// Puts a new item into the player's inventory and takes it off the map, as
++// the scripts' add_obj_to_inven does, so a map change does not free it.
++static int destructTestGive(Object* item, int count)
++{
++    int rc = itemAdd(gDude, item, count);
++    if (rc == 0) {
++        Rect rect;
++        _obj_disconnect(item, &rect);
++    }
++    return rc;
++}
++
 +// Wears armor `DESTRUCT_WEAR` with its art, as the inventory does: some
 +// weapons (rocket launchers) have art only with armor.
 +static void destructTestWear()
@@ -55,7 +69,7 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a36926
 +    if (getenv("DESTRUCT_WEAR") == nullptr || objectCreateWithPid(&armor, atoi(getenv("DESTRUCT_WEAR"))) != 0) {
 +        return;
 +    }
-+    itemAdd(gDude, armor, 1);
++    destructTestGive(armor, 1);
 +    Object* old = critterGetArmor(gDude);
 +    if (old != nullptr) {
 +        old->flags &= ~OBJECT_WORN;
@@ -80,7 +94,7 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a36926
      if (!autorunMutexCreate()) {
          return 1;
      }
-@@ -81,6 +120,279 @@ int falloutMain(int argc, char** argv)
+@@ -81,6 +134,424 @@ int falloutMain(int argc, char** argv)
          return 1;
      }
  
@@ -113,9 +127,38 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a36926
 +                int count = 0;
 +                Object* item;
 +                if (sscanf(list.substr(start, end - start).c_str(), "%d:%d", &pid, &count) == 2 && objectCreateWithPid(&item, pid) == 0) {
-+                    fprintf(stderr, "destruct: add %d x%d: %d\n", pid, count, itemAdd(gDude, item, count));
++                    fprintf(stderr, "destruct: add %d x%d: %d\n", pid, count, destructTestGive(item, count));
 +                }
 +                start = end + 1;
++            }
++            if (getenv("DESTRUCT_STRENGTH") != nullptr) {
++                critterSetBaseStat(gDude, STAT_STRENGTH, atoi(getenv("DESTRUCT_STRENGTH")));
++            }
++            if (getenv("DESTRUCT_LEVEL") != nullptr) {
++                int xp = pcGetExperienceForLevel(atoi(getenv("DESTRUCT_LEVEL"))) - pcGetStat(PC_STAT_EXPERIENCE);
++                if (xp > 0) {
++                    pcAddExperience(xp);
++                }
++            }
++            if (getenv("DESTRUCT_HP") != nullptr) {
++                int hp = atoi(getenv("DESTRUCT_HP"));
++                critterSetBonusStat(gDude, STAT_MAXIMUM_HIT_POINTS, hp - critterGetBaseStat(gDude, STAT_MAXIMUM_HIT_POINTS));
++                critterAdjustHitPoints(gDude, hp);
++            }
++            fprintf(stderr, "destruct: level %d hp %d of %d\n", pcGetStat(PC_STAT_LEVEL), critterGetHitPoints(gDude), critterGetStat(gDude, STAT_MAXIMUM_HIT_POINTS));
++            // "weapon:ammo": that weapon from the inventory into the right
++            // hand, loaded from that ammo in the inventory.
++            int wieldPid = 0;
++            int ammoPid = 0;
++            if (getenv("DESTRUCT_WIELD") != nullptr && sscanf(getenv("DESTRUCT_WIELD"), "%d:%d", &wieldPid, &ammoPid) == 2) {
++                Object* weapon = objectGetCarriedObjectByPid(gDude, wieldPid);
++                Object* ammo = objectGetCarriedObjectByPid(gDude, ammoPid);
++                if (weapon != nullptr && ammo != nullptr) {
++                    fprintf(stderr, "destruct: reload %d\n", weaponReload(weapon, ammo));
++                    fprintf(stderr, "destruct: wield %d, ammo %d\n", _inven_wield(gDude, weapon, 1), ammoGetQuantity(weapon));
++                    Rect held;
++                    objectSetFid(gDude, buildFid(OBJ_TYPE_CRITTER, gDude->fid & 0xFFF, 0, weaponGetAnimationCode(weapon), gDude->rotation + 1), &held);
++                }
 +            }
 +            fprintf(stderr, "destruct: resave %d\n", lsgTestSave(atoi(getenv("WRECKED_TEST_SLOT")), getenv("DESTRUCT_RESAVE")));
 +            return 0;
@@ -128,7 +171,7 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a36926
 +            for (const auto& entry : explosives) {
 +                Object* item;
 +                if (objectCreateWithPid(&item, entry[0]) == 0) {
-+                    itemAdd(gDude, item, entry[1]);
++                    destructTestGive(item, entry[1]);
 +                }
 +            }
 +            std::string list = makeSaves;
@@ -173,6 +216,13 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a36926
 +            return 0;
 +        }
 +        if (getenv("DESTRUCT_LIST") != nullptr) {
++            fprintf(stderr, "destruct: player level %d hp %d of %d strength %d weight %d of %d\n", pcGetStat(PC_STAT_LEVEL), critterGetHitPoints(gDude), critterGetStat(gDude, STAT_MAXIMUM_HIT_POINTS),
++                critterGetStat(gDude, STAT_STRENGTH), objectGetInventoryWeight(gDude), critterGetStat(gDude, STAT_CARRY_WEIGHT));
++            Inventory* inventory = &(gDude->data.inventory);
++            for (int index = 0; index < inventory->length; index++) {
++                Object* item = inventory->items[index].item;
++                fprintf(stderr, "destruct: carried pid %d x%d flags %08x name %s\n", item->pid, inventory->items[index].quantity, item->flags, objectGetName(item));
++            }
 +            // What stands near the player, by offset from the player's tile.
 +            for (int tile = gDude->tile - 12 * 200 - 12; tile <= gDude->tile + 12 * 200 + 12; tile++) {
 +                if (!tileIsValid(tile) || tileDistanceBetween(tile, gDude->tile) > 12) {
@@ -211,14 +261,38 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a36926
 +            }
 +            return 0;
 +        }
-+        // A meteor at the player's tile plus this.
++        // "map": the player goes there and back first, as through exit grids,
++        // so that the map comes back from its saved state.
++        if (getenv("DESTRUCT_TEST_VISIT") != nullptr) {
++            char visitName[64];
++            snprintf(visitName, sizeof(visitName), "%s", getenv("DESTRUCT_TEST_VISIT"));
++            int back = mapGetCurrentMap();
++            int visit = wmMapMatchNameToIdx(visitName);
++            int there = mapLoadById(visit);
++            int again = mapLoadById(back);
++            fprintf(stderr, "destruct: visit map %d: %d, back to %d: %d, player at %d\n", visit, there, back, again, gDude->tile);
++        }
++        // A meteor at the player's tile plus this, or with "critter" on the
++        // nearest other living critter.
 +        if (getenv("DESTRUCT_TEST_METEOR") != nullptr) {
 +            int tile = gDude->tile + atoi(getenv("DESTRUCT_TEST_METEOR"));
++            if (strcmp(getenv("DESTRUCT_TEST_METEOR"), "critter") == 0) {
++                Object* nearest = nullptr;
++                for (Object* object = objectFindFirstAtElevation(gElevation); object != nullptr; object = objectFindNextAtElevation()) {
++                    if (object != gDude && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && (object->data.critter.combat.results & DAM_DEAD) == 0
++                        && (nearest == nullptr || objectGetDistanceBetween(gDude, object) < objectGetDistanceBetween(gDude, nearest))) {
++                        nearest = object;
++                    }
++                }
++                if (nearest != nullptr) {
++                    tile = nearest->tile;
++                }
++            }
 +            tileSetCenter(tile, TILE_SET_CENTER_REFRESH_WINDOW | TILE_SET_CENTER_FLAG_IGNORE_SCROLL_RESTRICTIONS);
 +            auto listCritters = [&](const char* when) {
 +                for (Object* object = objectFindFirstAtElevation(gElevation); object != nullptr; object = objectFindNextAtElevation()) {
-+                    if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && tileDistanceBetween(object->tile, tile) <= 6) {
-+                        fprintf(stderr, "destruct: %s critter %p at %d (distance %d) hp %d results %x anim %d\n", when, (void*)object, object->tile, tileDistanceBetween(object->tile, tile), critterGetHitPoints(object), object->data.critter.combat.results, FID_ANIM_TYPE(object->fid));
++                    if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && tileDistanceBetween(object->tile, tile) <= 24) {
++                        fprintf(stderr, "destruct: %s critter %p at %d (distance %d) hp %d results %x anim %d who hit %p\n", when, (void*)object, object->tile, tileDistanceBetween(object->tile, tile), critterGetHitPoints(object), object->data.critter.combat.results, FID_ANIM_TYPE(object->fid), (void*)object->data.critter.combat.whoHitMe);
 +                    }
 +                }
 +            };
@@ -273,18 +347,45 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a36926
 +        }
 +        // "+offset,+offset,..." or tiles: explosions there one after another,
 +        // each followed by frames in DESTRUCT_TEST_OUT.
++        // 1: the peaceful setting on, 0: off, whatever wrecked.ini says.
++        if (getenv("DESTRUCT_TEST_PEACEFUL") != nullptr) {
++            destructTestSetPeaceful(atoi(getenv("DESTRUCT_TEST_PEACEFUL")) != 0);
++        }
 +        const char* destructTest = getenv("DESTRUCT_TEST");
 +        if (destructTest != nullptr) {
 +            const char* out = getenv("DESTRUCT_TEST_OUT");
 +            int damage = getenv("DESTRUCT_TEST_DAMAGE") != nullptr ? atoi(getenv("DESTRUCT_TEST_DAMAGE")) : 60;
++            // Frames after each explosion, fewer let them overlap;
++            // DESTRUCT_TEST_METEORS=1 drops meteors instead.
++            int gap = getenv("DESTRUCT_TEST_GAP") != nullptr ? atoi(getenv("DESTRUCT_TEST_GAP")) : 150;
++            bool meteors = getenv("DESTRUCT_TEST_METEORS") != nullptr;
 +            int index = 0;
 +            for (const char* item = destructTest; item != nullptr && *item != '\0'; item = strchr(item, ',') != nullptr ? strchr(item, ',') + 1 : nullptr) {
 +                int tile = (item[0] == '+' || item[0] == '-' ? gDude->tile : 0) + atoi(item);
 +                tileSetCenter(tile, TILE_SET_CENTER_REFRESH_WINDOW | TILE_SET_CENTER_FLAG_IGNORE_SCROLL_RESTRICTIONS);
-+                fprintf(stderr, "destruct: explosion %d at %d: %d\n", index, tile, actionExplode(tile, gElevation, damage / 2, damage, nullptr, true));
-+                for (int frame = 0; frame < 150; frame++) {
++                if (meteors) {
++                    destructMeteorAt(tile, gElevation);
++                    fprintf(stderr, "destruct: meteor %d at %d\n", index, tile);
++                } else {
++                    fprintf(stderr, "destruct: explosion %d at %d: %d\n", index, tile, actionExplode(tile, gElevation, damage / 2, damage, nullptr, true));
++                }
++                // How long the game's own work takes per frame: input,
++                // animation and drawing.
++                double total = 0.0;
++                double slowest = 0.0;
++                int slow = 0;
++                for (int frame = 0; frame < gap; frame++) {
++                    Uint64 start = SDL_GetPerformanceCounter();
 +                    inputGetInput();
++                    destructGameUpdate();
 +                    renderPresent();
++                    double ms = (SDL_GetPerformanceCounter() - start) * 1000.0 / SDL_GetPerformanceFrequency();
++                    total += ms;
++                    slowest = std::max(slowest, ms);
++                    slow += ms > 33.0;
++                    if (frame + 1 == gap) {
++                        fprintf(stderr, "destruct: frames %d: average %.1f ms, slowest %.1f ms, over 33 ms %d, particles %d, decals %d\n", frame + 1, total / (frame + 1), slowest, slow, destructTestParticleCount(), destructTestDecalCount());
++                    }
 +                    if (out != nullptr && (frame == 2 || frame == 6 || frame == 12 || frame == 20 || frame == 35 || frame == 60 || frame == 149)) {
 +                        char path[512];
 +                        snprintf(path, sizeof(path), "%s/e%d_f%03d.bmp", out, index, frame);
@@ -308,34 +409,92 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a36926
 +                        target = object;
 +                    }
 +                }
-+                Object* weapon;
-+                if (target != nullptr && objectCreateWithPid(&weapon, atoi(getenv("DESTRUCT_TEST_THROW"))) == 0) {
++                // The player's own one when the inventory has it.
++                Object* weapon = objectGetCarriedObjectByPid(gDude, atoi(getenv("DESTRUCT_TEST_THROW")));
++                bool carried = weapon != nullptr;
++                if (!carried && objectCreateWithPid(&weapon, atoi(getenv("DESTRUCT_TEST_THROW"))) != 0) {
++                    weapon = nullptr;
++                }
++                if (target != nullptr && weapon != nullptr) {
 +                    Rect moved;
 +                    objectSetLocation(gDude, tileGetTileInDirection(target->tile, ROTATION_SE, 5), gElevation, &moved);
 +                    destructTestWear();
-+                    itemAdd(gDude, weapon, 1);
++                    if (!carried) {
++                        destructTestGive(weapon, 1);
++                    }
++                    fprintf(stderr, "destruct: throw item %d %s\n", weapon->pid, carried ? "carried" : "new");
 +                    Object* ammo;
 +                    if (getenv("DESTRUCT_TEST_AMMO") != nullptr && objectCreateWithPid(&ammo, atoi(getenv("DESTRUCT_TEST_AMMO"))) == 0) {
 +                        fprintf(stderr, "destruct: reload %d\n", weaponReload(weapon, ammo));
 +                    }
-+                    fprintf(stderr, "destruct: wield %d, ammo %d\n", _inven_wield(gDude, weapon, 1), ammoGetQuantity(weapon));
++                    // Wielding the item already in the hand would take it out of the hand.
++                    fprintf(stderr, "destruct: wield %d, ammo %d\n", critterGetItem2(gDude) == weapon ? 0 : _inven_wield(gDude, weapon, 1), ammoGetQuantity(weapon));
 +                    // The attack clears the animation that would take the
 +                    // weapon out, so the player holds it at once.
 +                    Rect held;
 +                    objectSetFid(gDude, buildFid(OBJ_TYPE_CRITTER, gDude->fid & 0xFFF, 0, weaponGetAnimationCode(weapon), gDude->rotation + 1), &held);
 +                    tileSetCenter(target->tile, TILE_SET_CENTER_REFRESH_WINDOW | TILE_SET_CENTER_FLAG_IGNORE_SCROLL_RESTRICTIONS);
-+                    fprintf(stderr, "destruct: throw at %d (distance %d): %d\n", target->tile, objectGetDistanceBetween(gDude, target), _combat_attack(gDude, target, HIT_MODE_RIGHT_WEAPON_PRIMARY, HIT_LOCATION_UNCALLED));
-+                    for (int frame = 0; frame < (getenv("DESTRUCT_TEST_FRAMES") != nullptr ? atoi(getenv("DESTRUCT_TEST_FRAMES")) : 150); frame++) {
-+                        inputGetInput();
-+                        renderPresent();
-+                        if (out != nullptr && frame % 10 == 0) {
-+                            char path[512];
-+                            snprintf(path, sizeof(path), "%s/t_f%03d.bmp", out, frame);
-+                            destructTestSnapshot(path);
++                    // DESTRUCT_TEST_CLICK: as the player's click on the target,
++                    // DESTRUCT_TEST_SHOTS times, with the game's requests to
++                    // start combat handled each frame; a combat that starts
++                    // ends at the player's turn.
++                    bool click = getenv("DESTRUCT_TEST_CLICK") != nullptr;
++                    int shots = click && getenv("DESTRUCT_TEST_SHOTS") != nullptr ? atoi(getenv("DESTRUCT_TEST_SHOTS")) : 1;
++                    Object** critters;
++                    int count = objectListCreate(-1, gElevation, OBJ_TYPE_CRITTER, &critters);
++                    int deadBefore = 0;
++                    for (int index = 0; index < count; index++) {
++                        deadBefore += (critters[index]->data.critter.combat.results & DAM_DEAD) != 0;
++                    }
++                    if (count != 0) {
++                        objectListFree(critters);
++                    }
++                    fprintf(stderr, "destruct: peaceful %d, target hp %d, dead %d of %d\n", destructPeaceful(), critterGetHitPoints(target), deadBefore, count);
++                    for (int shot = 0; shot < shots; shot++) {
++                        if (click) {
++                            if (shot != 0 && ammoGetCapacity(weapon) > 0 && ammoGetQuantity(weapon) == 0 && getenv("DESTRUCT_TEST_AMMO") != nullptr && objectCreateWithPid(&ammo, atoi(getenv("DESTRUCT_TEST_AMMO"))) == 0) {
++                                weaponReload(weapon, ammo);
++                            }
++                            interfaceUpdateItems(false, INTERFACE_ITEM_ACTION_DEFAULT, INTERFACE_ITEM_ACTION_DEFAULT);
++                            if (interfaceGetCurrentHand() != HAND_RIGHT) {
++                                interfaceBarSwapHands(false);
++                            }
++                            int hitMode = -1;
++                            bool aiming = false;
++                            interfaceGetCurrentHitMode(&hitMode, &aiming);
++                            fprintf(stderr, "destruct: shot %d, hit mode %d, bad shot %d\n", shot, hitMode, _combat_check_bad_shot(gDude, target, hitMode, aiming));
++                            _game_user_wants_to_quit = destructPeaceful() ? 0 : 1;
++                            _combat_attack_this(target);
++                            fprintf(stderr, "destruct: click at %d (distance %d), in combat %d\n", target->tile, objectGetDistanceBetween(gDude, target), isInCombat());
++                        } else {
++                            fprintf(stderr, "destruct: throw at %d (distance %d): %d\n", target->tile, objectGetDistanceBetween(gDude, target), _combat_attack(gDude, target, HIT_MODE_RIGHT_WEAPON_PRIMARY, HIT_LOCATION_UNCALLED));
 +                        }
-+                        SDL_Delay(16);
++                        for (int frame = 0; frame < (getenv("DESTRUCT_TEST_FRAMES") != nullptr ? atoi(getenv("DESTRUCT_TEST_FRAMES")) : 150); frame++) {
++                            inputGetInput();
++                            if (click) {
++                                _game_user_wants_to_quit = destructPeaceful() ? 0 : 1;
++                                scriptsHandleRequests();
++                            }
++                            renderPresent();
++                            if (out != nullptr && frame % 10 == 0) {
++                                char path[512];
++                                snprintf(path, sizeof(path), "%s/t%d_f%03d.bmp", out, shot, frame);
++                                destructTestSnapshot(path);
++                            }
++                            SDL_Delay(16);
++                        }
++                        fprintf(stderr, "destruct: after shot %d target hp %d, dead flag %d, in combat %d\n", shot, critterGetHitPoints(target), (target->data.critter.combat.results & DAM_DEAD) != 0, isInCombat());
 +                    }
 +                    fprintf(stderr, "destruct: after throw decals %d\n", destructTestDecalCount());
++                    count = objectListCreate(-1, gElevation, OBJ_TYPE_CRITTER, &critters);
++                    int deadAfter = 0;
++                    for (int index = 0; index < count; index++) {
++                        deadAfter += (critters[index]->data.critter.combat.results & DAM_DEAD) != 0;
++                    }
++                    if (count != 0) {
++                        objectListFree(critters);
++                    }
++                    fprintf(stderr, "destruct: after throw target hp %d, dead %d of %d, in combat %d, ui %d\n", critterGetHitPoints(target), deadAfter, count, isInCombat(), gameUiIsDisabled() ? 0 : 1);
 +                }
 +            }
 +            if (getenv("DESTRUCT_TEST_SAVE") != nullptr) {

@@ -1,0 +1,9 @@
+# upstream fallout2-ce with patches/ applied (engine/), the local Fallout 2 install (game/, game files must never be pushed), builds, release zips and other local data
+/local/
+
+# Blender renders and the Python environment
+/wrecked/work/
+/.venv/
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,362 @@
+diff --git a/src/main.cc b/src/main.cc
+index ee67a0a437476a82e4a9b4483aef5607a8437e3d..548c4bf883ba4d03eb1baf5820a369260beb7d84 100644
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -3,21 +3,31 @@
+ #include <limits.h>
+ #include <string.h>
+ 
++#include <string>
++
++#include "actions.h"
++#include "animation.h"
+ #include "art.h"
+ #include "autorun.h"
+ #include "character_selector.h"
+ #include "color.h"
++#include "combat.h"
+ #include "credits.h"
++#include "critter.h"
+ #include "cycle.h"
+ #include "db.h"
+ #include "debug.h"
+ #include "draw.h"
+ #include "endgame.h"
++#include "destruct.h"
++#include "tile.h"
+ #include "game.h"
+ #include "game_mouse.h"
+ #include "game_movie.h"
+ #include "game_sound.h"
+ #include "input.h"
++#include "inventory.h"
++#include "item.h"
+ #include "kb.h"
+ #include "loadsave.h"
+ #include "mainmenu.h"
+@@ -33,6 +43,7 @@
+ #include "settings.h"
+ #include "sfall_config.h"
+ #include "sfall_global_scripts.h"
++#include "stat.h"
+ #include "svga.h"
+ #include "text_font.h"
+ #include "window.h"
+@@ -70,9 +81,37 @@ static bool _main_show_death_scene = false;
+ // 0x614838
+ static bool _main_death_voiceover_done;
+ 
++#ifdef WRECKED_TEST
++// Wears armor `DESTRUCT_WEAR` with its art, as the inventory does: some
++// weapons (rocket launchers) have art only with armor.
++static void destructTestWear()
++{
++    Object* armor;
++    if (getenv("DESTRUCT_WEAR") == nullptr || objectCreateWithPid(&armor, atoi(getenv("DESTRUCT_WEAR"))) != 0) {
++        return;
++    }
++    itemAdd(gDude, armor, 1);
++    Object* old = critterGetArmor(gDude);
++    if (old != nullptr) {
++        old->flags &= ~OBJECT_WORN;
++    }
++    armor->flags |= OBJECT_WORN;
++    _adjust_ac(gDude, old, armor);
++    int art = critterGetStat(gDude, STAT_GENDER) == GENDER_FEMALE ? armorGetFemaleFid(armor) : armorGetMaleFid(armor);
++    Rect rect;
++    fprintf(stderr, "destruct: wear %d art %d: %d\n", armor->pid, art, objectSetFid(gDude, buildFid(OBJ_TYPE_CRITTER, art, 0, 0, gDude->rotation + 1), &rect));
++}
++#endif
++
+ // 0x48099C
+ int falloutMain(int argc, char** argv)
+ {
++#ifdef WRECKED_TEST
++    if (getenv("WRECKED_TEST_MAP") != nullptr) {
++        SDL_SetHint(SDL_HINT_MAC_BACKGROUND_APP, "1");
++    }
++#endif
++
+     if (!autorunMutexCreate()) {
+         return 1;
+     }
+@@ -81,6 +120,279 @@ int falloutMain(int argc, char** argv)
+         return 1;
+     }
+ 
++#ifdef WRECKED_TEST
++    if (getenv("WRECKED_TEST_MAP") != nullptr) {
++        // Test runs return without the game's shutdown; the art cache would
++        // then be gone before the objects that hold its art.
++        atexit([] {
++            fflush(nullptr);
++            _exit(0);
++        });
++        char* testMap = compat_strdup(getenv("WRECKED_TEST_MAP"));
++        _main_load_new(testMap);
++        free(testMap);
++        if (getenv("WRECKED_TEST_SLOT") != nullptr) {
++            fprintf(stderr, "destruct: slot %d\n", lsgTestLoad(atoi(getenv("WRECKED_TEST_SLOT"))));
++        }
++        // "pid:count,...": items for the player after loading the slot, which
++        // is then saved back with `DESTRUCT_RESAVE` as its description.
++        if (getenv("WRECKED_TEST_SLOT") != nullptr && getenv("DESTRUCT_ADD_ITEMS") != nullptr && getenv("DESTRUCT_RESAVE") != nullptr) {
++            destructTestWear();
++            std::string list = getenv("DESTRUCT_ADD_ITEMS");
++            size_t start = 0;
++            while (start < list.size()) {
++                size_t end = list.find(',', start);
++                if (end == std::string::npos) {
++                    end = list.size();
++                }
++                int pid = 0;
++                int count = 0;
++                Object* item;
++                if (sscanf(list.substr(start, end - start).c_str(), "%d:%d", &pid, &count) == 2 && objectCreateWithPid(&item, pid) == 0) {
++                    fprintf(stderr, "destruct: add %d x%d: %d\n", pid, count, itemAdd(gDude, item, count));
++                }
++                start = end + 1;
++            }
++            fprintf(stderr, "destruct: resave %d\n", lsgTestSave(atoi(getenv("WRECKED_TEST_SLOT")), getenv("DESTRUCT_RESAVE")));
++            return 0;
++        }
++        // "slot=map=description;...": the player goes to each map and the game
++        // is saved there, with explosives to try things out.
++        const char* makeSaves = getenv("DESTRUCT_MAKE_SAVES");
++        if (makeSaves != nullptr) {
++            const int explosives[][2] = { { 51, 5 }, { 85, 3 }, { 25, 10 }, { 13, 1 }, { 14, 10 } };
++            for (const auto& entry : explosives) {
++                Object* item;
++                if (objectCreateWithPid(&item, entry[0]) == 0) {
++                    itemAdd(gDude, item, entry[1]);
++                }
++            }
++            std::string list = makeSaves;
++            size_t start = 0;
++            while (start < list.size()) {
++                size_t end = list.find(';', start);
++                if (end == std::string::npos) {
++                    end = list.size();
++                }
++                std::string entry = list.substr(start, end - start);
++                start = end + 1;
++                size_t first = entry.find('=');
++                size_t second = entry.find('=', first + 1);
++                if (first == std::string::npos || second == std::string::npos) {
++                    continue;
++                }
++                int slot = atoi(entry.substr(0, first).c_str());
++                char mapName[64];
++                snprintf(mapName, sizeof(mapName), "%s", entry.substr(first + 1, second - first - 1).c_str());
++                std::string description = entry.substr(second + 1);
++                int loaded = mapLoadByName(mapName);
++                int mapIndex = wmMapMatchNameToIdx(mapName);
++                int area;
++                if (mapIndex != -1 && wmMatchAreaContainingMapIdx(mapIndex, &area) == 0) {
++                    wmAreaSetVisibleState(area, 1, true);
++                    wmAreaMarkVisitedState(area, 2);
++                    wmTeleportToArea(area);
++                }
++                for (int frame = 0; frame < 30; frame++) {
++                    inputGetInput();
++                    renderPresent();
++                    SDL_Delay(16);
++                }
++                int saved = lsgTestSave(slot - 1, description.c_str());
++                fprintf(stderr, "destruct: slot %d %s (%s): load %d save %d tile %d elevation %d\n", slot, mapName, description.c_str(), loaded, saved, gDude->tile, gElevation);
++                if (getenv("DESTRUCT_TEST_OUT") != nullptr) {
++                    char path[512];
++                    snprintf(path, sizeof(path), "%s/save%02d.bmp", getenv("DESTRUCT_TEST_OUT"), slot);
++                    destructTestSnapshot(path);
++                }
++            }
++            return 0;
++        }
++        if (getenv("DESTRUCT_LIST") != nullptr) {
++            // What stands near the player, by offset from the player's tile.
++            for (int tile = gDude->tile - 12 * 200 - 12; tile <= gDude->tile + 12 * 200 + 12; tile++) {
++                if (!tileIsValid(tile) || tileDistanceBetween(tile, gDude->tile) > 12) {
++                    continue;
++                }
++                for (Object* object = objectFindFirstAtLocation(gElevation, tile); object != nullptr; object = objectFindNextAtLocation()) {
++                    fprintf(stderr, "destruct object: offset %+d tile %d distance %d type %d fid %08x pid %08x sid %d flags %08x\n",
++                        tile - gDude->tile, tile, tileDistanceBetween(tile, gDude->tile), FID_TYPE(object->fid), object->fid, object->pid, object->sid, object->flags);
++                }
++            }
++        }
++        // "x,y": the meteor at the cursor put on this point of the screen; the
++        // beam with DESTRUCT_TEST_AIM_BEAM.
++        if (getenv("DESTRUCT_TEST_AIM") != nullptr) {
++            int x = 0;
++            int y = 0;
++            sscanf(getenv("DESTRUCT_TEST_AIM"), "%d,%d", &x, &y);
++            for (int frame = 0; frame < 300; frame++) {
++                _mouse_set_position(x, y);
++                if (frame == 10) {
++                    if (getenv("DESTRUCT_TEST_AIM_BEAM") != nullptr) {
++                        destructBeamAtCursor();
++                    } else {
++                        destructMeteorAtCursor();
++                    }
++                }
++                inputGetInput();
++                destructGameUpdate();
++                renderPresent();
++                if (getenv("DESTRUCT_TEST_OUT") != nullptr && frame % 3 == 0) {
++                    char path[512];
++                    snprintf(path, sizeof(path), "%s/a_f%03d.bmp", getenv("DESTRUCT_TEST_OUT"), frame);
++                    destructTestSnapshot(path);
++                }
++                SDL_Delay(16);
++            }
++            return 0;
++        }
++        // A meteor at the player's tile plus this.
++        if (getenv("DESTRUCT_TEST_METEOR") != nullptr) {
++            int tile = gDude->tile + atoi(getenv("DESTRUCT_TEST_METEOR"));
++            tileSetCenter(tile, TILE_SET_CENTER_REFRESH_WINDOW | TILE_SET_CENTER_FLAG_IGNORE_SCROLL_RESTRICTIONS);
++            auto listCritters = [&](const char* when) {
++                for (Object* object = objectFindFirstAtElevation(gElevation); object != nullptr; object = objectFindNextAtElevation()) {
++                    if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && tileDistanceBetween(object->tile, tile) <= 6) {
++                        fprintf(stderr, "destruct: %s critter %p at %d (distance %d) hp %d results %x anim %d\n", when, (void*)object, object->tile, tileDistanceBetween(object->tile, tile), critterGetHitPoints(object), object->data.critter.combat.results, FID_ANIM_TYPE(object->fid));
++                    }
++                }
++            };
++            listCritters("before");
++            destructMeteorAt(tile, gElevation);
++            for (int frame = 0; frame < 300; frame++) {
++                inputGetInput();
++                destructGameUpdate();
++                renderPresent();
++                if (getenv("DESTRUCT_TEST_OUT") != nullptr && frame % 3 == 0) {
++                    char path[512];
++                    snprintf(path, sizeof(path), "%s/m_f%03d.bmp", getenv("DESTRUCT_TEST_OUT"), frame);
++                    destructTestSnapshot(path);
++                }
++                SDL_Delay(16);
++            }
++            listCritters("after");
++            fprintf(stderr, "destruct: player at %d hp %d\n", gDude->tile, critterGetHitPoints(gDude));
++            return 0;
++        }
++        // "from,to": the beam from orbit at the player's tile plus `from`,
++        // dragged toward the player's tile plus `to`.
++        if (getenv("DESTRUCT_TEST_BEAM") != nullptr) {
++            int from = 0;
++            int to = 0;
++            sscanf(getenv("DESTRUCT_TEST_BEAM"), "%d,%d", &from, &to);
++            tileSetCenter(gDude->tile + from, TILE_SET_CENTER_REFRESH_WINDOW | TILE_SET_CENTER_FLAG_IGNORE_SCROLL_RESTRICTIONS);
++            int beamTile = gDude->tile + from;
++            auto listCritters = [&](const char* when) {
++                for (Object* object = objectFindFirstAtElevation(gElevation); object != nullptr; object = objectFindNextAtElevation()) {
++                    if (FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && tileDistanceBetween(object->tile, beamTile) <= 6) {
++                        fprintf(stderr, "destruct: %s critter %p at %d (distance %d) hp %d results %x anim %d\n", when, (void*)object, object->tile, tileDistanceBetween(object->tile, beamTile), critterGetHitPoints(object), object->data.critter.combat.results, FID_ANIM_TYPE(object->fid));
++                    }
++                }
++            };
++            listCritters("before");
++            destructBeamAt(gDude->tile + from, gElevation, gDude->tile + to);
++            for (int frame = 0; frame < 300; frame++) {
++                inputGetInput();
++                destructGameUpdate();
++                renderPresent();
++                if (getenv("DESTRUCT_TEST_OUT") != nullptr && frame % 6 == 0) {
++                    char path[512];
++                    snprintf(path, sizeof(path), "%s/b_f%03d.bmp", getenv("DESTRUCT_TEST_OUT"), frame);
++                    destructTestSnapshot(path);
++                }
++                SDL_Delay(16);
++            }
++            listCritters("after");
++            fprintf(stderr, "destruct: player at %d hp %d results %x\n", gDude->tile, critterGetHitPoints(gDude), gDude->data.critter.combat.results);
++            return 0;
++        }
++        // "+offset,+offset,..." or tiles: explosions there one after another,
++        // each followed by frames in DESTRUCT_TEST_OUT.
++        const char* destructTest = getenv("DESTRUCT_TEST");
++        if (destructTest != nullptr) {
++            const char* out = getenv("DESTRUCT_TEST_OUT");
++            int damage = getenv("DESTRUCT_TEST_DAMAGE") != nullptr ? atoi(getenv("DESTRUCT_TEST_DAMAGE")) : 60;
++            int index = 0;
++            for (const char* item = destructTest; item != nullptr && *item != '\0'; item = strchr(item, ',') != nullptr ? strchr(item, ',') + 1 : nullptr) {
++                int tile = (item[0] == '+' || item[0] == '-' ? gDude->tile : 0) + atoi(item);
++                tileSetCenter(tile, TILE_SET_CENTER_REFRESH_WINDOW | TILE_SET_CENTER_FLAG_IGNORE_SCROLL_RESTRICTIONS);
++                fprintf(stderr, "destruct: explosion %d at %d: %d\n", index, tile, actionExplode(tile, gElevation, damage / 2, damage, nullptr, true));
++                for (int frame = 0; frame < 150; frame++) {
++                    inputGetInput();
++                    renderPresent();
++                    if (out != nullptr && (frame == 2 || frame == 6 || frame == 12 || frame == 20 || frame == 35 || frame == 60 || frame == 149)) {
++                        char path[512];
++                        snprintf(path, sizeof(path), "%s/e%d_f%03d.bmp", out, index, frame);
++                        destructTestSnapshot(path);
++                    }
++                    SDL_Delay(16);
++                }
++                if (out != nullptr) {
++                    destructTestDumpDamage(out);
++                }
++                fprintf(stderr, "destruct: decals %d, target blocked %d\n", destructTestDecalCount(), _obj_blocking_at(nullptr, tile, gElevation) != nullptr);
++                index++;
++            }
++            // "pid": the player throws or fires it at the nearest other
++            // critter, through the combat code.
++            if (getenv("DESTRUCT_TEST_THROW") != nullptr) {
++                Object* target = nullptr;
++                for (Object* object = objectFindFirstAtElevation(gElevation); object != nullptr; object = objectFindNextAtElevation()) {
++                    if (object != gDude && FID_TYPE(object->fid) == OBJ_TYPE_CRITTER && (object->data.critter.combat.results & DAM_DEAD) == 0
++                        && (target == nullptr || objectGetDistanceBetween(gDude, object) < objectGetDistanceBetween(gDude, target))) {
++                        target = object;
++                    }
++                }
++                Object* weapon;
++                if (target != nullptr && objectCreateWithPid(&weapon, atoi(getenv("DESTRUCT_TEST_THROW"))) == 0) {
++                    Rect moved;
++                    objectSetLocation(gDude, tileGetTileInDirection(target->tile, ROTATION_SE, 5), gElevation, &moved);
++                    destructTestWear();
++                    itemAdd(gDude, weapon, 1);
++                    Object* ammo;
++                    if (getenv("DESTRUCT_TEST_AMMO") != nullptr && objectCreateWithPid(&ammo, atoi(getenv("DESTRUCT_TEST_AMMO"))) == 0) {
++                        fprintf(stderr, "destruct: reload %d\n", weaponReload(weapon, ammo));
++                    }
++                    fprintf(stderr, "destruct: wield %d, ammo %d\n", _inven_wield(gDude, weapon, 1), ammoGetQuantity(weapon));
++                    // The attack clears the animation that would take the
++                    // weapon out, so the player holds it at once.
++                    Rect held;
++                    objectSetFid(gDude, buildFid(OBJ_TYPE_CRITTER, gDude->fid & 0xFFF, 0, weaponGetAnimationCode(weapon), gDude->rotation + 1), &held);
++                    tileSetCenter(target->tile, TILE_SET_CENTER_REFRESH_WINDOW | TILE_SET_CENTER_FLAG_IGNORE_SCROLL_RESTRICTIONS);
++                    fprintf(stderr, "destruct: throw at %d (distance %d): %d\n", target->tile, objectGetDistanceBetween(gDude, target), _combat_attack(gDude, target, HIT_MODE_RIGHT_WEAPON_PRIMARY, HIT_LOCATION_UNCALLED));
++                    for (int frame = 0; frame < (getenv("DESTRUCT_TEST_FRAMES") != nullptr ? atoi(getenv("DESTRUCT_TEST_FRAMES")) : 150); frame++) {
++                        inputGetInput();
++                        renderPresent();
++                        if (out != nullptr && frame % 10 == 0) {
++                            char path[512];
++                            snprintf(path, sizeof(path), "%s/t_f%03d.bmp", out, frame);
++                            destructTestSnapshot(path);
++                        }
++                        SDL_Delay(16);
++                    }
++                    fprintf(stderr, "destruct: after throw decals %d\n", destructTestDecalCount());
++                }
++            }
++            if (getenv("DESTRUCT_TEST_SAVE") != nullptr) {
++                int slot = atoi(getenv("DESTRUCT_TEST_SAVE"));
++                int before = destructTestDecalCount();
++                fprintf(stderr, "destruct: save %d\n", lsgTestSave(slot));
++                fprintf(stderr, "destruct: load %d\n", lsgTestLoad(slot));
++                fprintf(stderr, "destruct: decals before %d after %d\n", before, destructTestDecalCount());
++                if (out != nullptr) {
++                    tileWindowRefresh();
++                    char path[512];
++                    snprintf(path, sizeof(path), "%s/reloaded.bmp", out);
++                    destructTestSnapshot(path);
++                }
++            }
++            return 0;
++        }
++        return 0;
++    }
++#endif
++
+     // SFALL: Allow to skip intro movies
+     int skipOpeningMovies;
+     configGetInt(&gSfallConfig, SFALL_CONFIG_MISC_KEY, SFALL_CONFIG_SKIP_OPENING_MOVIES_KEY, &skipOpeningMovies);

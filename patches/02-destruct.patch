@@ -1,0 +1,4374 @@
+diff --git a/src/destruct.cc b/src/destruct.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..f9cc65d5fac16a531ff9d708356aa54e639d50f8
+--- /dev/null
++++ b/src/destruct.cc
+@@ -0,0 +1,4290 @@
++#include "destruct.h"
++
++#include <math.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <algorithm>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include <SDL.h>
++#include <zlib.h>
++
++#include "actions.h"
++#include "animation.h"
++#include "art.h"
++#include "color.h"
++#include "config.h"
++#include "critter.h"
++#include "db.h"
++#include "game.h"
++#include "game_sound.h"
++#include "input.h"
++#include "light.h"
++#include "map.h"
++#include "mouse.h"
++#include "object.h"
++#include "platform_compat.h"
++#include "proto.h"
++#include "proto_types.h"
++#include "tile.h"
++#include "window_manager.h"
++
++namespace fallout {
++
++// Palette indices from here up glow: lighting leaves them alone and the
++// palette animates some of them.
++static constexpr int kGlowStart = 0xE5;
++static constexpr int kSlime = 229;
++static constexpr int kMonitors = 233;
++static constexpr int kFireSlow = 238;
++
++// Screen pixels per second squared.
++static constexpr float kGravity = 700.0f;
++static constexpr size_t kMaxParticles = 3000;
++static constexpr int kPendingCount = 16;
++static constexpr float kFlashTime = 0.25f;
++static constexpr float kShakeTime = 0.5f;
++// How far above the ground the game draws roofs, in screen pixels.
++static constexpr int kRoofHeight = 96;
++
++// Art rendered in Blender: shade (128 is the color as is), then for piles a
++// chunk number picking one of the pile's colors, then coverage.
++typedef struct DestructSprite {
++    int frames;
++    int width;
++    int height;
++    int channels;
++    // The point that sits on the ground, from the top left.
++    int anchorX;
++    int anchorY;
++    std::vector<unsigned char> data;
++
++    const unsigned char* pixel(int frame, int x, int y) const
++    {
++        return &(data[(((size_t)frame * height + y) * width + x) * channels]);
++    }
++} DestructSprite;
++
++typedef enum ParticleKind {
++    // Pixels cut from broken art or the ground.
++    PARTICLE_PIECE,
++    // A spinning chunk of a single color.
++    PARTICLE_CHUNK,
++    PARTICLE_SPARK,
++    PARTICLE_FIRE,
++    PARTICLE_SMOKE,
++} ParticleKind;
++
++// What broken things are made of, from their protos: how they break and
++// what they leave.
++typedef enum DestructMaterial {
++    DESTRUCT_STONE,
++    DESTRUCT_WOOD,
++    DESTRUCT_METAL,
++    DESTRUCT_GLASS,
++    DESTRUCT_CLOTH,
++} DestructMaterial;
++
++typedef struct Particle {
++    ParticleKind kind;
++    DestructMaterial material;
++    int elevation;
++    // Positions are screen pixels from the center of this tile: `x` and `y`
++    // on the ground, `z` the height above it.
++    int anchor;
++    float x;
++    float y;
++    float z;
++    float vx;
++    float vy;
++    float vz;
++    float age;
++    float life;
++    // Seconds before it shows up.
++    float delay;
++    float scale;
++    float growth;
++    float opacity;
++    // Frames per second of a chunk.
++    float spin;
++    const DestructSprite* sprite;
++    int frame;
++    int variant;
++    // Base color of a chunk or smoke.
++    unsigned char color;
++    DestructBlast blast;
++    // Stays on the ground when it stops.
++    bool keep;
++    bool dead;
++    int width;
++    int height;
++    std::vector<unsigned char> pixels;
++    // The ground tile, for the draw order.
++    int tile;
++    Rect drawn;
++    bool hasDrawn;
++} Particle;
++
++typedef enum DecalKind {
++    // Darkens and lightens the floor under it (craters, scorch).
++    DECAL_SHADE,
++    // A heap of chunks in the colors of what broke.
++    DECAL_PILE,
++    // Pixels of its own: debris, the stub of a broken wall.
++    DECAL_PIXELS,
++} DecalKind;
++
++typedef struct Decal {
++    unsigned char kind;
++    int elevation;
++    int tile;
++    // Top left, screen pixels from the tile's screen position.
++    int x;
++    int y;
++    std::string sprite;
++    int frame;
++    unsigned char colors[8];
++    int width;
++    int height;
++    std::vector<unsigned char> pixels;
++    const DestructSprite* resolved;
++} Decal;
++
++typedef struct PendingBlast {
++    int tile;
++    int elevation;
++    int radius;
++    int damage;
++    DestructBlast blast;
++    // A meteor's: breaks as far and as hard as one.
++    bool meteor;
++} PendingBlast;
++
++typedef struct DestructConfig {
++    bool enabled = true;
++    bool walls = true;
++    bool scenery = true;
++    bool craters = true;
++    bool shake = true;
++    bool flash = true;
++    bool testKey = true;
++    // The test key calls a beam down from orbit instead of a plain blast.
++    bool beam = true;
++    // G drops a meteor at the cursor.
++    bool meteor = true;
++    int wallStrength = 30;
++    int sceneryStrength = 10;
++    // Percent of the usual amount of flying debris.
++    int debris = 100;
++    int maxDecals = 3000;
++    std::vector<std::string> blockedMaps;
++} DestructConfig;
++
++// The broken art of an object as it was on screen.
++typedef struct DestructFrame {
++    int left;
++    int top;
++    int width;
++    int height;
++    // Where the object stands.
++    int groundX;
++    int groundY;
++    std::vector<unsigned char> pixels;
++} DestructFrame;
++
++// What blasts did to a wall or a piece of scenery that still stands, per
++// pixel of its art: 0 as drawn, `kGone` gone, anything else the intensity it
++// is drawn at (soot, the rims of broken edges).
++static constexpr unsigned char kGone = 255;
++
++typedef struct Damage {
++    int elevation;
++    int tile;
++    int fid;
++    int width;
++    int height;
++    std::vector<unsigned char> mask;
++    // The art with the damage, for `frame` and `rotation`.
++    std::vector<unsigned char> pixels;
++    int frame;
++    int rotation;
++} Damage;
++
++// What blasts took out of a roof square, as for walls.
++typedef struct RoofDamage {
++    int fid;
++    int width;
++    int height;
++    std::vector<unsigned char> mask;
++    // The art with the damage.
++    std::vector<unsigned char> pixels;
++} RoofDamage;
++
++static DestructConfig gDestructConfig;
++static bool gDestructInitialized = false;
++static unsigned char* gDestructBuffer = nullptr;
++static int gDestructPitch = 0;
++static int gDestructWidth = 0;
++static int gDestructHeight = 0;
++static unsigned int gDestructLastTick = 0;
++static uint32_t gDestructSeed = 0x9E3779B9;
++
++static std::unordered_map<std::string, DestructSprite> gDestructSprites;
++static std::vector<Particle> gParticles;
++// Particles by ground tile, for one pass of the map renderer.
++static std::vector<std::pair<int, int>> gParticleOrder;
++static std::unordered_map<std::string, std::vector<Decal>> gDestructDecals;
++static std::string gDestructMap;
++static std::unordered_map<std::string, std::vector<Damage>> gDestructDamage;
++// Where each damaged object of the current map is in its list.
++static std::unordered_map<uint64_t, size_t> gDamageIndex;
++static bool gDamageIndexDirty = true;
++// Per map, by elevation times the square count plus the square.
++static std::unordered_map<std::string, std::unordered_map<int, RoofDamage>> gDestructRoofs;
++// A near black that isn't transparent.
++static unsigned char gDestructDark = 1;
++static PendingBlast gPending[kPendingCount];
++static int gPendingNext = 0;
++
++static bool gDestructColorsReady = false;
++static unsigned char gDestructColorTable[32768];
++// Hot to cold for fire, plasma and EMP.
++static unsigned char gDestructRamp[3][32];
++
++static int gFlashTile = -1;
++static int gFlashElevation = 0;
++static float gFlashAge = 0.0f;
++static float gFlashRadius = 0.0f;
++static bool gFlashDirty = false;
++
++static unsigned int gShakeStart = 0;
++static float gShakeAmplitude = 0.0f;
++
++// The beam from orbit: a red marker while it aims, then a column of light
++// that follows the cursor and sets the ground off as it goes.
++static constexpr float kBeamAim = 1.1f;
++static constexpr float kBeamCharge = 0.3f;
++static constexpr float kBeamFire = 1.9f;
++static constexpr float kBeamFade = 0.35f;
++static constexpr float kBeamBlastEvery = 0.22f;
++// Ground pixels per second it can follow the cursor.
++static constexpr float kBeamSpeed = 75.0f;
++
++typedef struct Beam {
++    bool active;
++    int elevation;
++    // Where it hits: screen pixels from the center of this tile.
++    int anchor;
++    float x;
++    float y;
++    float age;
++    float nextBlast;
++    int sounds;
++    // Followed instead of the cursor when not -1.
++    int steerTile;
++    // How far above the ground it is drawn hitting: on a roof, the roof.
++    float lift;
++    Rect drawn;
++    bool hasDrawn;
++} Beam;
++
++static Beam gBeam;
++// Blasts of the beam waiting for the game loop, which sets them off as the
++// game's own explosions: they hurt whoever stands there.
++static std::vector<std::pair<int, int>> gBeamBlasts;
++
++// A meteor: it comes in from high up, burning, and hits the cursor's tile.
++static constexpr float kMeteorFall = 1.7f;
++// Where it starts: ground pixels from where it lands, and its height.
++static constexpr float kMeteorFromX = 340.0f;
++static constexpr float kMeteorFromY = -90.0f;
++static constexpr float kMeteorHeight = 330.0f;
++
++typedef struct Meteor {
++    bool active;
++    int elevation;
++    int tile;
++    float age;
++    // How far above the ground it hits: on a roof, the roof.
++    float lift;
++    Rect drawn;
++    bool hasDrawn;
++} Meteor;
++
++static Meteor gMeteor;
++// Its impact, waiting for the game loop.
++static int gMeteorImpactTile = -1;
++static int gMeteorImpactElevation = 0;
++// While set, an explosion breaks as far and as hard as a meteor.
++static bool gBlastMeteor = false;
++
++static const int kBayer[4][4] = {
++    { 0, 8, 2, 10 },
++    { 12, 4, 14, 6 },
++    { 3, 11, 1, 9 },
++    { 15, 7, 13, 5 },
++};
++
++// Hot to cold, six steps each.
++static const int kRampKeys[3][6][3] = {
++    { { 255, 250, 210 }, { 255, 222, 110 }, { 250, 150, 40 }, { 210, 80, 20 }, { 120, 36, 14 }, { 50, 34, 28 } },
++    { { 230, 255, 225 }, { 140, 255, 110 }, { 50, 210, 45 }, { 24, 120, 24 }, { 16, 56, 16 }, { 30, 34, 30 } },
++    { { 245, 245, 255 }, { 160, 190, 255 }, { 90, 120, 240 }, { 44, 56, 170 }, { 22, 24, 80 }, { 30, 30, 36 } },
++};
++
++static void destructTick();
++
++static float destructRandom()
++{
++    gDestructSeed ^= gDestructSeed << 13;
++    gDestructSeed ^= gDestructSeed >> 17;
++    gDestructSeed ^= gDestructSeed << 5;
++    return (gDestructSeed >> 8) / 16777216.0f;
++}
++
++static float destructBetween(float min, float max)
++{
++    return min + (max - min) * destructRandom();
++}
++
++static int destructPick(int count)
++{
++    return std::min(count - 1, (int)(destructRandom() * count));
++}
++
++static uint32_t destructHash(int x, int y)
++{
++    uint32_t value = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u;
++    value = (value ^ (value >> 13)) * 1274126177u;
++    return value ^ (value >> 16);
++}
++
++static std::string destructMapKey(const char* name)
++{
++    std::string key;
++    for (const char* pch = name; *pch != '\0' && *pch != '.'; pch++) {
++        key += (char)toupper((unsigned char)*pch);
++    }
++    return key;
++}
++
++static void destructLoadConfig()
++{
++    gDestructConfig = DestructConfig();
++
++    Config config;
++    if (!configInit(&config)) {
++        return;
++    }
++
++    if (configRead(&config, "wrecked-fallout-2/wrecked.ini", false)) {
++        configGetBool(&config, "wrecked", "enabled", &(gDestructConfig.enabled));
++        configGetBool(&config, "wrecked", "walls", &(gDestructConfig.walls));
++        configGetBool(&config, "wrecked", "scenery", &(gDestructConfig.scenery));
++        configGetBool(&config, "wrecked", "craters", &(gDestructConfig.craters));
++        configGetBool(&config, "wrecked", "shake", &(gDestructConfig.shake));
++        configGetBool(&config, "wrecked", "flash", &(gDestructConfig.flash));
++        configGetBool(&config, "wrecked", "test_key", &(gDestructConfig.testKey));
++        configGetBool(&config, "wrecked", "beam", &(gDestructConfig.beam));
++        configGetBool(&config, "wrecked", "meteor", &(gDestructConfig.meteor));
++        configGetInt(&config, "wrecked", "wall_strength", &(gDestructConfig.wallStrength));
++        configGetInt(&config, "wrecked", "scenery_strength", &(gDestructConfig.sceneryStrength));
++        configGetInt(&config, "wrecked", "debris", &(gDestructConfig.debris));
++        configGetInt(&config, "wrecked", "max_decals", &(gDestructConfig.maxDecals));
++
++        char* blocked;
++        if (configGetString(&config, "wrecked", "blocked_maps", &blocked)) {
++            std::string list = blocked;
++            size_t start = 0;
++            while (start <= list.size()) {
++                size_t end = list.find(',', start);
++                if (end == std::string::npos) {
++                    end = list.size();
++                }
++                std::string name = destructMapKey(list.substr(start, end - start).c_str());
++                name.erase(std::remove(name.begin(), name.end(), ' '), name.end());
++                if (!name.empty()) {
++                    gDestructConfig.blockedMaps.push_back(name);
++                }
++                start = end + 1;
++            }
++        }
++    }
++
++    configFree(&config);
++
++    gDestructConfig.debris = std::clamp(gDestructConfig.debris, 0, 400);
++    gDestructConfig.maxDecals = std::clamp(gDestructConfig.maxDecals, 0, 20000);
++    gDestructConfig.wallStrength = std::clamp(gDestructConfig.wallStrength, 1, 1000);
++    gDestructConfig.sceneryStrength = std::clamp(gDestructConfig.sceneryStrength, 1, 1000);
++}
++
++static void destructLoadSprites()
++{
++    gDestructSprites.clear();
++
++    FILE* stream = fopen("wrecked-fallout-2/sprites.dat", "rb");
++    if (stream == nullptr) {
++        return;
++    }
++
++    char magic[4];
++    uint32_t count;
++    if (fread(magic, 1, 4, stream) != 4 || memcmp(magic, "DST1", 4) != 0 || fread(&count, 4, 1, stream) != 1) {
++        fclose(stream);
++        return;
++    }
++
++    for (uint32_t index = 0; index < count; index++) {
++        char name[16];
++        uint16_t header[4];
++        int16_t anchor[2];
++        if (fread(name, 1, 16, stream) != 16 || fread(header, 2, 4, stream) != 4 || fread(anchor, 2, 2, stream) != 2) {
++            break;
++        }
++
++        DestructSprite sprite;
++        sprite.frames = header[0];
++        sprite.width = header[1];
++        sprite.height = header[2];
++        sprite.channels = header[3];
++        sprite.anchorX = anchor[0];
++        sprite.anchorY = anchor[1];
++        if (sprite.frames < 1 || sprite.frames > 64 || sprite.width < 1 || sprite.width > 1024 || sprite.height < 1 || sprite.height > 1024 || sprite.channels < 1 || sprite.channels > 3) {
++            break;
++        }
++        size_t size = (size_t)sprite.frames * sprite.width * sprite.height * sprite.channels;
++        sprite.data.resize(size);
++        if (fread(sprite.data.data(), 1, size, stream) != size) {
++            break;
++        }
++
++        if (sprite.frames < 1 || (sprite.channels != 2 && sprite.channels != 3)) {
++            continue;
++        }
++
++        name[15] = '\0';
++        gDestructSprites[name] = std::move(sprite);
++    }
++
++    fclose(stream);
++}
++
++static const DestructSprite* destructSprite(const std::string& name)
++{
++    auto it = gDestructSprites.find(name);
++    return it != gDestructSprites.end() ? &(it->second) : nullptr;
++}
++
++// One of `prefix`0, `prefix`1, ... at random.
++static const DestructSprite* destructSpriteVariant(const char* prefix, std::string* name = nullptr)
++{
++    int count = 0;
++    while (gDestructSprites.find(prefix + std::to_string(count)) != gDestructSprites.end()) {
++        count++;
++    }
++
++    if (count == 0) {
++        return nullptr;
++    }
++
++    std::string chosen = prefix + std::to_string(destructPick(count));
++    if (name != nullptr) {
++        *name = chosen;
++    }
++    return destructSprite(chosen);
++}
++
++static void destructColorRgb(unsigned char color, int* r, int* g, int* b)
++{
++    *r = _cmap[color * 3] * 4;
++    *g = _cmap[color * 3 + 1] * 4;
++    *b = _cmap[color * 3 + 2] * 4;
++}
++
++// The palette's color closest to `r`, `g`, `b`: never transparent and never
++// one that glows.
++static unsigned char destructNearest(int r, int g, int b)
++{
++    int best = 1;
++    int bestDistance = INT32_MAX;
++    for (int index = 1; index < kGlowStart; index++) {
++        int pr;
++        int pg;
++        int pb;
++        destructColorRgb(index, &pr, &pg, &pb);
++        int distance = (pr - r) * (pr - r) * 3 + (pg - g) * (pg - g) * 4 + (pb - b) * (pb - b) * 2;
++        if (distance < bestDistance) {
++            bestDistance = distance;
++            best = index;
++        }
++    }
++    return (unsigned char)best;
++}
++
++static void destructPrepareColors()
++{
++    if (gDestructColorsReady) {
++        return;
++    }
++
++    for (int index = 0; index < 32768; index++) {
++        unsigned char color = _colorTable[index];
++        if (color == 0 || color >= kGlowStart) {
++            int r = ((index >> 10) & 0x1F) * 8 + 4;
++            int g = ((index >> 5) & 0x1F) * 8 + 4;
++            int b = (index & 0x1F) * 8 + 4;
++            color = destructNearest(r, g, b);
++        }
++        gDestructColorTable[index] = color;
++    }
++
++    for (int blast = 0; blast < 3; blast++) {
++        for (int index = 0; index < 32; index++) {
++            float position = (1.0f - index / 31.0f) * 5.0f;
++            int key = std::min(4, (int)position);
++            float t = position - key;
++            int rgb[3];
++            for (int channel = 0; channel < 3; channel++) {
++                rgb[channel] = (int)(kRampKeys[blast][key][channel] * (1.0f - t) + kRampKeys[blast][key + 1][channel] * t);
++            }
++            gDestructRamp[blast][index] = destructNearest(rgb[0], rgb[1], rgb[2]);
++        }
++    }
++
++    gDestructDark = destructNearest(8, 8, 8);
++    gDestructColorsReady = true;
++}
++
++static inline unsigned char destructColor(int r, int g, int b)
++{
++    r = std::clamp(r, 0, 255);
++    g = std::clamp(g, 0, 255);
++    b = std::clamp(b, 0, 255);
++    return gDestructColorTable[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)];
++}
++
++static inline unsigned char destructLit(unsigned char color, int light)
++{
++    return color < kGlowStart ? intensityColorTable[color][light] : color;
++}
++
++static int destructLightAt(int elevation, int tile)
++{
++    int light = std::max(lightGetAmbientIntensity(), lightGetTileIntensity(elevation, tile));
++    return std::clamp(light / 512, 0, 255);
++}
++
++// The floor art's pixel at a point of the iso window, 0 where there is none.
++static unsigned char destructFloorPixel(int x, int y, int elevation)
++{
++    int square = squareTileFromScreenXY(x, y, elevation);
++    if (square == -1) {
++        return 0;
++    }
++
++    const int candidates[5] = { square, square + 1, square - 1, square + SQUARE_GRID_WIDTH, square - SQUARE_GRID_WIDTH };
++    for (int candidate : candidates) {
++        if (candidate < 0 || candidate >= SQUARE_GRID_SIZE) {
++            continue;
++        }
++
++        int id = _square[elevation]->field_0[candidate] & 0xFFFF;
++        if ((id & 0x1000) != 0 || (id & 0xFFF) <= 1) {
++            continue;
++        }
++
++        int floorX;
++        int floorY;
++        if (squareTileToScreenXY(candidate, &floorX, &floorY, elevation) != 0) {
++            continue;
++        }
++
++        CacheEntry* handle;
++        Art* art = artLock(buildFid(OBJ_TYPE_TILE, id & 0xFFF, 0, 0, 0), &handle);
++        if (art == nullptr) {
++            continue;
++        }
++
++        unsigned char color = 0;
++        int width = artGetWidth(art, 0, 0);
++        int height = artGetHeight(art, 0, 0);
++        unsigned char* data = artGetFrameData(art, 0, 0);
++        int localX = x - floorX;
++        int localY = y - floorY;
++        if (data != nullptr && localX >= 0 && localY >= 0 && localX < width && localY < height) {
++            color = data[localY * width + localX];
++        }
++        artUnlock(handle);
++
++        if (color != 0) {
++            return color;
++        }
++    }
++
++    return 0;
++}
++
++static bool destructTileCenter(int tile, int elevation, int* x, int* y)
++{
++    if (tileToScreenXY(tile, x, y, elevation) != 0) {
++        return false;
++    }
++    *x += 16;
++    *y += 8;
++    return true;
++}
++
++static bool destructObjectFrame(Object* object, DestructFrame* frame)
++{
++    CacheEntry* handle;
++    Art* art = artLock(object->fid, &handle);
++    if (art == nullptr) {
++        return false;
++    }
++
++    int width = artGetWidth(art, object->frame, object->rotation);
++    int height = artGetHeight(art, object->frame, object->rotation);
++    unsigned char* data = artGetFrameData(art, object->frame, object->rotation);
++    int x;
++    int y;
++    if (data == nullptr || width <= 0 || height <= 0 || !destructTileCenter(object->tile, object->elevation, &x, &y)) {
++        artUnlock(handle);
++        return false;
++    }
++
++    frame->groundX = x;
++    frame->groundY = y;
++    x += art->xOffsets[object->rotation] + object->x;
++    y += art->yOffsets[object->rotation] + object->y;
++    frame->left = x - width / 2;
++    frame->top = y - (height - 1);
++    frame->width = width;
++    frame->height = height;
++    frame->pixels.assign(data, data + width * height);
++    artUnlock(handle);
++    return true;
++}
++
++static DestructMaterial destructMaterialFrom(int material)
++{
++    switch (material) {
++    case MATERIAL_TYPE_GLASS:
++        return DESTRUCT_GLASS;
++    case MATERIAL_TYPE_METAL:
++    case MATERIAL_TYPE_PLASTIC:
++        return DESTRUCT_METAL;
++    case MATERIAL_TYPE_WOOD:
++        return DESTRUCT_WOOD;
++    case MATERIAL_TYPE_LEATHER:
++        return DESTRUCT_CLOTH;
++    default:
++        return DESTRUCT_STONE;
++    }
++}
++
++static DestructMaterial destructObjectMaterial(Object* object)
++{
++    Proto* proto;
++    if (protoGetProto(object->pid, &proto) == -1) {
++        return DESTRUCT_STONE;
++    }
++    return destructMaterialFrom(PID_TYPE(object->pid) == OBJ_TYPE_WALL ? proto->wall.material : proto->scenery.field_2C);
++}
++
++// Eight colors of the art from its middle tones, darkest first.
++static void destructFrameColors(const DestructFrame& frame, unsigned char* colors)
++{
++    std::vector<std::pair<int, unsigned char>> samples;
++    for (int attempt = 0; attempt < 400 && samples.size() < 48; attempt++) {
++        unsigned char color = frame.pixels[destructPick((int)frame.pixels.size())];
++        if (color == 0 || color >= kGlowStart) {
++            continue;
++        }
++        int r;
++        int g;
++        int b;
++        destructColorRgb(color, &r, &g, &b);
++        samples.push_back({ r * 3 + g * 6 + b, color });
++    }
++
++    if (samples.empty()) {
++        for (int index = 0; index < 8; index++) {
++            colors[index] = destructNearest(90, 84, 76);
++        }
++        return;
++    }
++
++    std::sort(samples.begin(), samples.end());
++    for (int index = 0; index < 8; index++) {
++        float position = 0.2f + 0.65f * index / 7.0f;
++        colors[index] = samples[std::min(samples.size() - 1, (size_t)(position * samples.size()))].second;
++    }
++}
++
++static std::vector<Decal>* destructCurrentDecals()
++{
++    if (gDestructMap.empty()) {
++        return nullptr;
++    }
++    return &(gDestructDecals[gDestructMap]);
++}
++
++static void destructAddDecal(Decal&& decal)
++{
++    std::vector<Decal>* decals = destructCurrentDecals();
++    if (decals == nullptr || gDestructConfig.maxDecals == 0) {
++        return;
++    }
++
++    if (decal.kind != DECAL_PIXELS) {
++        decal.resolved = destructSprite(decal.sprite);
++        if (decal.resolved == nullptr) {
++            return;
++        }
++        decal.width = decal.resolved->width;
++        decal.height = decal.resolved->height;
++    }
++
++    decals->push_back(std::move(decal));
++
++    // Oldest debris goes first; craters and piles only once no debris is left.
++    if ((int)decals->size() > gDestructConfig.maxDecals) {
++        auto it = std::find_if(decals->begin(), decals->end(), [](const Decal& other) {
++            return other.kind == DECAL_PIXELS;
++        });
++        decals->erase(it != decals->end() ? it : decals->begin());
++    }
++}
++
++static bool destructDecalRect(const Decal& decal, Rect* rect)
++{
++    int x;
++    int y;
++    if (tileToScreenXY(decal.tile, &x, &y, decal.elevation) != 0) {
++        return false;
++    }
++    rect->left = x + decal.x;
++    rect->top = y + decal.y;
++    rect->right = rect->left + decal.width - 1;
++    rect->bottom = rect->top + decal.height - 1;
++    return true;
++}
++
++static bool destructClip(const Rect* rect, const Rect* bounds, Rect* clipped)
++{
++    Rect screen = { 0, 0, gDestructWidth - 1, gDestructHeight - 1 };
++    Rect temp;
++    if (rectIntersection(rect, bounds, &temp) != 0) {
++        return false;
++    }
++    return rectIntersection(&temp, &screen, clipped) == 0;
++}
++
++void destructRenderDecals(Rect* rect, int elevation)
++{
++    if (!gDestructInitialized || gDestructBuffer == nullptr) {
++        return;
++    }
++
++    auto it = gDestructDecals.find(gDestructMap);
++    if (it == gDestructDecals.end()) {
++        return;
++    }
++
++    for (const Decal& decal : it->second) {
++        if (decal.elevation != elevation) {
++            continue;
++        }
++
++        Rect decalRect;
++        Rect clipped;
++        if (!destructDecalRect(decal, &decalRect) || !destructClip(&decalRect, rect, &clipped)) {
++            continue;
++        }
++
++        if (decal.kind == DECAL_SHADE) {
++            const DestructSprite* sprite = decal.resolved;
++            int frame = std::min(decal.frame, sprite->frames - 1);
++            for (int y = clipped.top; y <= clipped.bottom; y++) {
++                unsigned char* dest = gDestructBuffer + y * gDestructPitch;
++                for (int x = clipped.left; x <= clipped.right; x++) {
++                    const unsigned char* pixel = sprite->pixel(frame, x - decalRect.left, y - decalRect.top);
++                    int alpha = pixel[sprite->channels - 1];
++                    if (alpha == 0 || dest[x] >= kGlowStart) {
++                        continue;
++                    }
++                    int level = 128 + (pixel[0] - 128) * alpha / 255;
++                    dest[x] = intensityColorTable[dest[x]][std::clamp(level, 0, 255)];
++                }
++            }
++            continue;
++        }
++
++        int light = destructLightAt(elevation, decal.tile);
++
++        if (decal.kind == DECAL_PILE) {
++            const DestructSprite* sprite = decal.resolved;
++            int frame = std::min(decal.frame, sprite->frames - 1);
++            for (int y = clipped.top; y <= clipped.bottom; y++) {
++                unsigned char* dest = gDestructBuffer + y * gDestructPitch;
++                for (int x = clipped.left; x <= clipped.right; x++) {
++                    const unsigned char* pixel = sprite->pixel(frame, x - decalRect.left, y - decalRect.top);
++                    if (pixel[sprite->channels - 1] < 128) {
++                        continue;
++                    }
++                    int chunk = sprite->channels == 3 ? pixel[1] : 0;
++                    unsigned char color = intensityColorTable[decal.colors[chunk & 7]][pixel[0]];
++                    dest[x] = destructLit(color, light);
++                }
++            }
++            continue;
++        }
++
++        for (int y = clipped.top; y <= clipped.bottom; y++) {
++            unsigned char* dest = gDestructBuffer + y * gDestructPitch;
++            const unsigned char* source = decal.pixels.data() + (y - decalRect.top) * decal.width - decalRect.left;
++            for (int x = clipped.left; x <= clipped.right; x++) {
++                if (source[x] != 0) {
++                    dest[x] = destructLit(source[x], light);
++                }
++            }
++        }
++    }
++}
++
++// Pieces tumble in quarter turns: their size and pixels turned `frame` times.
++static void destructPieceSize(const Particle& particle, int* width, int* height)
++{
++    bool turned = (particle.frame & 1) != 0;
++    *width = turned ? particle.height : particle.width;
++    *height = turned ? particle.width : particle.height;
++}
++
++static inline unsigned char destructPiecePixel(const Particle& particle, int u, int v)
++{
++    int w = particle.width;
++    int h = particle.height;
++    switch (particle.frame & 3) {
++    case 1:
++        return particle.pixels[(h - 1 - u) * w + v];
++    case 2:
++        return particle.pixels[(h - 1 - v) * w + (w - 1 - u)];
++    case 3:
++        return particle.pixels[u * w + (w - 1 - v)];
++    default:
++        return particle.pixels[v * w + u];
++    }
++}
++
++static bool destructParticleRect(const Particle& particle, Rect* rect)
++{
++    int anchorX;
++    int anchorY;
++    if (!destructTileCenter(particle.anchor, particle.elevation, &anchorX, &anchorY)) {
++        return false;
++    }
++
++    int groundX = anchorX + (int)floorf(particle.x);
++    int groundY = anchorY + (int)floorf(particle.y);
++    int top = groundY - (int)floorf(particle.z);
++
++    switch (particle.kind) {
++    case PARTICLE_PIECE: {
++        int width;
++        int height;
++        destructPieceSize(particle, &width, &height);
++        rect->left = groundX - width / 2;
++        rect->top = top - height + 1;
++        rect->right = rect->left + width - 1;
++        rect->bottom = top;
++        return true;
++    }
++    case PARTICLE_CHUNK:
++        rect->left = groundX - particle.sprite->anchorX;
++        rect->top = top - particle.sprite->anchorY;
++        rect->right = rect->left + particle.sprite->width - 1;
++        rect->bottom = rect->top + particle.sprite->height - 1;
++        return true;
++    case PARTICLE_SPARK: {
++        int tailX = groundX - (int)(particle.vx * 0.015f);
++        int tailY = top - (int)((particle.vy - particle.vz) * 0.015f);
++        rect->left = std::min(groundX, tailX);
++        rect->right = std::max(groundX, tailX);
++        rect->top = std::min(top, tailY);
++        rect->bottom = std::max(top, tailY);
++        return true;
++    }
++    case PARTICLE_FIRE:
++    case PARTICLE_SMOKE: {
++        int width = std::max(1, (int)(particle.sprite->width * particle.scale));
++        int height = std::max(1, (int)(particle.sprite->height * particle.scale));
++        rect->left = groundX - width / 2;
++        rect->top = top - height / 2;
++        rect->right = rect->left + width - 1;
++        rect->bottom = rect->top + height - 1;
++        return true;
++    }
++    }
++
++    return false;
++}
++
++static void destructDrawLine(int x0, int y0, int x1, int y1, const Rect* clip, unsigned char head, unsigned char tail)
++{
++    int dx = abs(x1 - x0);
++    int dy = abs(y1 - y0);
++    int steps = std::max(dx, dy);
++    for (int step = 0; step <= steps; step++) {
++        int x = steps == 0 ? x0 : x0 + (x1 - x0) * step / steps;
++        int y = steps == 0 ? y0 : y0 + (y1 - y0) * step / steps;
++        if (x >= clip->left && x <= clip->right && y >= clip->top && y <= clip->bottom) {
++            gDestructBuffer[y * gDestructPitch + x] = step * 2 <= steps ? head : tail;
++        }
++    }
++}
++
++// A puff's shade and coverage between its pixels, so that it grows smoothly.
++static void destructSample(const DestructSprite* sprite, int frame, float x, float y, int* shade, int* alpha)
++{
++    x = std::clamp(x - 0.5f, 0.0f, sprite->width - 1.001f);
++    y = std::clamp(y - 0.5f, 0.0f, sprite->height - 1.001f);
++    int left = (int)x;
++    int top = (int)y;
++    int right = std::min(left + 1, sprite->width - 1);
++    int bottom = std::min(top + 1, sprite->height - 1);
++    float fx = x - left;
++    float fy = y - top;
++    const unsigned char* a = sprite->pixel(frame, left, top);
++    const unsigned char* b = sprite->pixel(frame, right, top);
++    const unsigned char* c = sprite->pixel(frame, left, bottom);
++    const unsigned char* d = sprite->pixel(frame, right, bottom);
++    int last = sprite->channels - 1;
++    float wa = (1 - fx) * (1 - fy);
++    float wb = fx * (1 - fy);
++    float wc = (1 - fx) * fy;
++    float wd = fx * fy;
++    *shade = (int)(a[0] * wa + b[0] * wb + c[0] * wc + d[0] * wd);
++    *alpha = (int)(a[last] * wa + b[last] * wb + c[last] * wc + d[last] * wd);
++}
++
++static void destructDrawParticle(const Particle& particle, Rect* rect, int light)
++{
++    Rect particleRect;
++    Rect clipped;
++    if (!destructParticleRect(particle, &particleRect) || !destructClip(&particleRect, rect, &clipped)) {
++        return;
++    }
++
++    switch (particle.kind) {
++    case PARTICLE_PIECE: {
++        // Glass glints as it turns.
++        int glint = particle.material == DESTRUCT_GLASS && ((int)(particle.age * 16.0f) + particle.variant) % 3 == 0 ? 200 : 128;
++        for (int y = clipped.top; y <= clipped.bottom; y++) {
++            unsigned char* dest = gDestructBuffer + y * gDestructPitch;
++            for (int x = clipped.left; x <= clipped.right; x++) {
++                unsigned char color = destructPiecePixel(particle, x - particleRect.left, y - particleRect.top);
++                if (color != 0) {
++                    if (glint != 128 && color < kGlowStart) {
++                        color = intensityColorTable[color][glint];
++                    }
++                    dest[x] = destructLit(color, light);
++                }
++            }
++        }
++        break;
++    }
++    case PARTICLE_CHUNK: {
++        const DestructSprite* sprite = particle.sprite;
++        int frame = particle.frame % sprite->frames;
++        for (int y = clipped.top; y <= clipped.bottom; y++) {
++            unsigned char* dest = gDestructBuffer + y * gDestructPitch;
++            for (int x = clipped.left; x <= clipped.right; x++) {
++                const unsigned char* pixel = sprite->pixel(frame, x - particleRect.left, y - particleRect.top);
++                if (pixel[sprite->channels - 1] >= 128) {
++                    dest[x] = destructLit(intensityColorTable[particle.color][pixel[0]], light);
++                }
++            }
++        }
++        break;
++    }
++    case PARTICLE_SPARK: {
++        int anchorX;
++        int anchorY;
++        destructTileCenter(particle.anchor, particle.elevation, &anchorX, &anchorY);
++        int x = anchorX + (int)floorf(particle.x);
++        int y = anchorY + (int)floorf(particle.y) - (int)floorf(particle.z);
++        int tailX = x - (int)(particle.vx * 0.015f);
++        int tailY = y - (int)((particle.vy - particle.vz) * 0.015f);
++        unsigned char head;
++        unsigned char tail;
++        if (particle.blast == DESTRUCT_BLAST_PLASMA) {
++            head = kSlime + particle.variant % 4;
++            tail = kSlime + (particle.variant + 2) % 4;
++        } else if (particle.blast == DESTRUCT_BLAST_EMP) {
++            head = kMonitors + particle.variant % 5;
++            tail = kMonitors + (particle.variant + 2) % 5;
++        } else {
++            head = kFireSlow + particle.variant % 5;
++            tail = kFireSlow + (particle.variant + 3) % 5;
++        }
++        destructDrawLine(x, y, tailX, tailY, &clipped, head, tail);
++        break;
++    }
++    case PARTICLE_FIRE: {
++        const DestructSprite* sprite = particle.sprite;
++        int width = particleRect.right - particleRect.left + 1;
++        int height = particleRect.bottom - particleRect.top + 1;
++        float heat = 1.0f - particle.age / particle.life;
++        float fade = std::min(1.0f, 2.2f * heat);
++        const unsigned char* ramp = gDestructRamp[particle.blast];
++        for (int y = clipped.top; y <= clipped.bottom; y++) {
++            unsigned char* dest = gDestructBuffer + y * gDestructPitch;
++            float sourceY = (y - particleRect.top + 0.5f) * sprite->height / height;
++            for (int x = clipped.left; x <= clipped.right; x++) {
++                float sourceX = (x - particleRect.left + 0.5f) * sprite->width / width;
++                int shade;
++                int alpha;
++                destructSample(sprite, particle.frame, sourceX, sourceY, &shade, &alpha);
++                alpha = (int)(alpha * fade);
++                if (alpha <= 8) {
++                    continue;
++                }
++                float glow = std::clamp(heat * (0.35f + 0.9f * shade / 255.0f), 0.0f, 1.0f);
++                unsigned char color = ramp[(int)(glow * 31.0f)];
++                if (alpha >= 200) {
++                    dest[x] = glow > 0.86f && particle.blast == DESTRUCT_BLAST_FIRE ? kFireSlow + (int)(destructHash(x, y) % 5) : color;
++                    continue;
++                }
++                // Thin fire at the edges lets what is behind show through.
++                int r;
++                int g;
++                int b;
++                destructColorRgb(color, &r, &g, &b);
++                int under = Color2RGB(dest[x]);
++                int underR = ((under >> 10) & 0x1F) * 8;
++                int underG = ((under >> 5) & 0x1F) * 8;
++                int underB = (under & 0x1F) * 8;
++                dest[x] = destructColor(underR + (r - underR) * alpha / 200,
++                    underG + (g - underG) * alpha / 200,
++                    underB + (b - underB) * alpha / 200);
++            }
++        }
++        break;
++    }
++    case PARTICLE_SMOKE: {
++        const DestructSprite* sprite = particle.sprite;
++        int width = particleRect.right - particleRect.left + 1;
++        int height = particleRect.bottom - particleRect.top + 1;
++        float t = particle.age / particle.life;
++        float fade = std::min(1.0f, particle.age / 0.25f) * (t < 0.4f ? 1.0f : std::max(0.0f, 1.0f - (t - 0.4f) / 0.6f));
++        int opacity = (int)(particle.opacity * fade * 256.0f);
++        if (opacity <= 0) {
++            break;
++        }
++        int baseR;
++        int baseG;
++        int baseB;
++        destructColorRgb(particle.color, &baseR, &baseG, &baseB);
++        // Smoke takes the light of where it is.
++        int lightScale = std::max(light, 40);
++        for (int y = clipped.top; y <= clipped.bottom; y++) {
++            unsigned char* dest = gDestructBuffer + y * gDestructPitch;
++            float sourceY = (y - particleRect.top + 0.5f) * sprite->height / height;
++            for (int x = clipped.left; x <= clipped.right; x++) {
++                float sourceX = (x - particleRect.left + 0.5f) * sprite->width / width;
++                int shade;
++                int alpha;
++                destructSample(sprite, particle.frame, sourceX, sourceY, &shade, &alpha);
++                alpha = alpha * opacity >> 8;
++                if (alpha <= 4) {
++                    continue;
++                }
++                shade = (90 + shade) * lightScale / 128;
++                int r = baseR * shade >> 8;
++                int g = baseG * shade >> 8;
++                int b = baseB * shade >> 8;
++                int under = Color2RGB(dest[x]);
++                int underR = ((under >> 10) & 0x1F) * 8;
++                int underG = ((under >> 5) & 0x1F) * 8;
++                int underB = (under & 0x1F) * 8;
++                dest[x] = destructColor(underR + (r - underR) * alpha / 255,
++                    underG + (g - underG) * alpha / 255,
++                    underB + (b - underB) * alpha / 255);
++            }
++        }
++        break;
++    }
++    }
++}
++
++bool destructHasParticles(int elevation)
++{
++    gParticleOrder.clear();
++    if (!gDestructInitialized) {
++        return false;
++    }
++
++    for (size_t index = 0; index < gParticles.size(); index++) {
++        const Particle& particle = gParticles[index];
++        if (particle.elevation == elevation && particle.delay <= 0.0f && !particle.dead && particle.tile != -1) {
++            gParticleOrder.push_back({ particle.tile, (int)index });
++        }
++    }
++    std::sort(gParticleOrder.begin(), gParticleOrder.end());
++    return !gParticleOrder.empty();
++}
++
++void destructRenderTile(int tile, Rect* rect, int elevation)
++{
++    auto it = std::lower_bound(gParticleOrder.begin(), gParticleOrder.end(), std::make_pair(tile, -1));
++    if (it == gParticleOrder.end() || it->first != tile) {
++        return;
++    }
++
++    int light = destructLightAt(elevation, tile);
++    for (; it != gParticleOrder.end() && it->first == tile; ++it) {
++        destructDrawParticle(gParticles[it->second], rect, light);
++    }
++}
++
++static bool destructFlashRect(Rect* rect)
++{
++    int x;
++    int y;
++    if (gFlashTile == -1 || !destructTileCenter(gFlashTile, gFlashElevation, &x, &y)) {
++        return false;
++    }
++    int radiusX = (int)gFlashRadius;
++    int radiusY = (int)(gFlashRadius * 0.62f);
++    y -= 14;
++    rect->left = x - radiusX;
++    rect->right = x + radiusX;
++    rect->top = y - radiusY;
++    rect->bottom = y + radiusY;
++    return true;
++}
++
++void destructRenderOverlay(Rect* rect, int elevation)
++{
++    if (!gDestructInitialized || gFlashTile == -1 || gFlashElevation != elevation || gFlashAge >= kFlashTime) {
++        return;
++    }
++
++    Rect flashRect;
++    Rect clipped;
++    if (!destructFlashRect(&flashRect) || !destructClip(&flashRect, rect, &clipped)) {
++        return;
++    }
++
++    float centerX = (flashRect.left + flashRect.right) / 2.0f;
++    float centerY = (flashRect.top + flashRect.bottom) / 2.0f;
++    float radiusX = (flashRect.right - flashRect.left) / 2.0f + 0.5f;
++    float radiusY = (flashRect.bottom - flashRect.top) / 2.0f + 0.5f;
++    float strength = 1.0f - gFlashAge / kFlashTime;
++    strength *= strength;
++    for (int y = clipped.top; y <= clipped.bottom; y++) {
++        unsigned char* dest = gDestructBuffer + y * gDestructPitch;
++        float dy = (y - centerY) / radiusY;
++        for (int x = clipped.left; x <= clipped.right; x++) {
++            float dx = (x - centerX) / radiusX;
++            float distance = dx * dx + dy * dy;
++            if (distance >= 1.0f || dest[x] >= kGlowStart) {
++                continue;
++            }
++            // Dithered, so that the light fades out without rings.
++            int level = 128 + (int)(80.0f * strength * (1.0f - distance) + kBayer[y & 3][x & 3] / 4.0f);
++            dest[x] = intensityColorTable[dest[x]][std::min(level, 255)];
++        }
++    }
++}
++
++void destructShakeOffset(int* x, int* y)
++{
++    *x = 0;
++    *y = 0;
++    if (gShakeAmplitude <= 0.0f) {
++        return;
++    }
++
++    float t = (SDL_GetTicks() - gShakeStart) / 1000.0f;
++    if (t >= kShakeTime) {
++        gShakeAmplitude = 0.0f;
++        return;
++    }
++
++    float amplitude = gShakeAmplitude * (1.0f - t / kShakeTime) * (1.0f - t / kShakeTime);
++    *x = (int)lroundf(amplitude * sinf(t * 71.0f));
++    *y = (int)lroundf(amplitude * 0.6f * cosf(t * 57.0f));
++}
++
++static Particle destructNewParticle(ParticleKind kind, int anchor, int elevation)
++{
++    Particle particle;
++    particle.kind = kind;
++    particle.material = DESTRUCT_STONE;
++    particle.elevation = elevation;
++    particle.anchor = anchor;
++    particle.x = 0.0f;
++    particle.y = 0.0f;
++    particle.z = 0.0f;
++    particle.vx = 0.0f;
++    particle.vy = 0.0f;
++    particle.vz = 0.0f;
++    particle.age = 0.0f;
++    particle.life = 10.0f;
++    particle.delay = 0.0f;
++    particle.scale = 1.0f;
++    particle.growth = 0.0f;
++    particle.opacity = 1.0f;
++    particle.spin = 0.0f;
++    particle.sprite = nullptr;
++    particle.frame = 0;
++    particle.variant = 0;
++    particle.color = 0;
++    particle.blast = DESTRUCT_BLAST_FIRE;
++    particle.keep = false;
++    particle.dead = false;
++    particle.width = 0;
++    particle.height = 0;
++    particle.tile = anchor;
++    particle.hasDrawn = false;
++    return particle;
++}
++
++static int destructParticleTile(const Particle& particle)
++{
++    int anchorX;
++    int anchorY;
++    if (!destructTileCenter(particle.anchor, particle.elevation, &anchorX, &anchorY)) {
++        return -1;
++    }
++    return tileFromScreenXY(anchorX + (int)floorf(particle.x), anchorY + (int)floorf(particle.y), particle.elevation);
++}
++
++static void destructAddParticle(Particle&& particle)
++{
++    if (gParticles.size() >= kMaxParticles) {
++        return;
++    }
++    particle.tile = destructParticleTile(particle);
++    if (particle.tile == -1) {
++        return;
++    }
++    gParticles.push_back(std::move(particle));
++}
++
++static void destructLaunch(Particle* particle, float fromX, float fromY, float speed, float lift)
++{
++    float dx = particle->x - fromX;
++    float dy = (particle->y - fromY) * 2.0f;
++    float length = sqrtf(dx * dx + dy * dy);
++    if (length < 1.0f) {
++        float angle = destructBetween(0.0f, 6.2831853f);
++        dx = cosf(angle);
++        dy = sinf(angle);
++    } else {
++        dx /= length;
++        dy /= length;
++    }
++    particle->vx = dx * speed + destructBetween(-12.0f, 12.0f);
++    particle->vy = dy * speed * 0.5f + destructBetween(-6.0f, 6.0f);
++    particle->vz = lift;
++}
++
++// Cuts the art into pieces that fly away from the blast: splinters along the
++// grain for wood, crumbs for glass. Pieces of a roof fall from roof height
++// onto the floor under them.
++static void destructShatter(const DestructFrame& frame, int anchor, int elevation, float blastX, float blastY, float power, bool wall, DestructMaterial material, bool roof = false)
++{
++    int anchorX;
++    int anchorY;
++    if (!destructTileCenter(anchor, elevation, &anchorX, &anchorY)) {
++        return;
++    }
++
++    std::vector<int> opaque;
++    for (int index = 0; index < frame.width * frame.height; index++) {
++        if (frame.pixels[index] != 0) {
++            opaque.push_back(index);
++        }
++    }
++    if (opaque.empty()) {
++        return;
++    }
++
++    // Small pieces: nothing big and recognizable flies.
++    int area = material == DESTRUCT_GLASS ? 14 : (wall ? 60 : 45);
++    int cells = std::clamp((int)opaque.size() / area, 3, material == DESTRUCT_GLASS ? 200 : 120);
++    std::vector<std::pair<int, int>> seeds;
++    for (int index = 0; index < cells; index++) {
++        int pixel = opaque[destructPick((int)opaque.size())];
++        seeds.push_back({ pixel % frame.width, pixel / frame.width });
++    }
++
++    std::vector<int> labels(frame.width * frame.height, -1);
++    std::vector<Rect> bounds(cells, Rect { INT32_MAX, INT32_MAX, INT32_MIN, INT32_MIN });
++    std::vector<int> counts(cells, 0);
++    for (int pixel : opaque) {
++        int x = pixel % frame.width;
++        int y = pixel / frame.width;
++        int best = 0;
++        int bestDistance = INT32_MAX;
++        for (int cell = 0; cell < cells; cell++) {
++            int dx = x - seeds[cell].first;
++            int dy = y - seeds[cell].second;
++            // Rough edges, as broken things have; boards split along their
++            // grain, metal tears cleaner.
++            int rough = (int)(destructHash(x * 7 + cell, y * 13) & 31);
++            int distance;
++            if (material == DESTRUCT_WOOD) {
++                distance = dx * dx * 6 + dy * dy / 2 + rough * 3;
++            } else if (material == DESTRUCT_METAL) {
++                distance = dx * dx + dy * dy + rough;
++            } else {
++                distance = dx * dx + dy * dy + rough * 3;
++            }
++            if (distance < bestDistance) {
++                bestDistance = distance;
++                best = cell;
++            }
++        }
++        labels[pixel] = best;
++        Rect* rect = &(bounds[best]);
++        rect->left = std::min(rect->left, x);
++        rect->top = std::min(rect->top, y);
++        rect->right = std::max(rect->right, x);
++        rect->bottom = std::max(rect->bottom, y);
++        counts[best]++;
++    }
++
++    for (int cell = 0; cell < cells; cell++) {
++        if (counts[cell] == 0) {
++            continue;
++        }
++
++        const Rect& rect = bounds[cell];
++        // Bits of see-through art (fences, grates) read as specks of dirt
++        // once on the ground; the shards of their material stand in for them.
++        int boxArea = (rect.right - rect.left + 1) * (rect.bottom - rect.top + 1);
++        if (counts[cell] * 10 < boxArea * 3 && boxArea > 12) {
++            continue;
++        }
++
++        Particle piece = destructNewParticle(PARTICLE_PIECE, anchor, elevation);
++        piece.width = rect.right - rect.left + 1;
++        piece.height = rect.bottom - rect.top + 1;
++        piece.pixels.assign(piece.width * piece.height, 0);
++        for (int y = rect.top; y <= rect.bottom; y++) {
++            for (int x = rect.left; x <= rect.right; x++) {
++                int pixel = y * frame.width + x;
++                if (labels[pixel] == cell) {
++                    piece.pixels[(y - rect.top) * piece.width + (x - rect.left)] = frame.pixels[pixel];
++                }
++            }
++        }
++
++        int centerX = frame.left + rect.left + piece.width / 2;
++        int bottom = frame.top + rect.bottom;
++        int groundY = frame.groundY + (int)destructBetween(-3.0f, 3.0f);
++        piece.x = (float)(centerX - anchorX);
++        piece.material = material;
++        piece.variant = destructPick(8);
++        if (roof) {
++            piece.y = (float)(bottom + kRoofHeight - anchorY);
++            piece.z = (float)kRoofHeight;
++        } else if (bottom < groundY) {
++            piece.y = (float)(groundY - anchorY);
++            piece.z = (float)(groundY - bottom);
++        } else {
++            piece.y = (float)(bottom - anchorY);
++            piece.z = 0.0f;
++        }
++
++        float mass = sqrtf(std::max(1.0f, counts[cell] / 30.0f));
++        float speed = power * destructBetween(40.0f, 170.0f) / mass * (wall ? 0.7f : 1.0f);
++        float lift = power * destructBetween(30.0f, 190.0f) / mass + (piece.z > 30.0f ? 0.0f : 40.0f);
++        if (roof) {
++            // It loses its hold and drops, pushed a little by the blast.
++            speed *= 0.25f;
++            lift = destructBetween(0.0f, 50.0f);
++        }
++        destructLaunch(&piece, blastX, blastY, speed, lift);
++        if (std::max(piece.width, piece.height) <= 18 || material == DESTRUCT_GLASS) {
++            piece.spin = destructBetween(5.0f, 14.0f);
++            piece.frame = destructPick(4);
++        }
++        piece.keep = true;
++        destructAddParticle(std::move(piece));
++    }
++}
++
++static void destructSmoke(int anchor, int elevation, float x, float y, float z, unsigned char color, float opacity, float scale, float delay, float life)
++{
++    const DestructSprite* sprite = destructSpriteVariant("puff");
++    if (sprite == nullptr) {
++        return;
++    }
++
++    Particle smoke = destructNewParticle(PARTICLE_SMOKE, anchor, elevation);
++    smoke.sprite = sprite;
++    smoke.frame = destructPick(sprite->frames);
++    smoke.x = x;
++    smoke.y = y;
++    smoke.z = z;
++    smoke.vx = destructBetween(-8.0f, 14.0f);
++    smoke.vy = destructBetween(-4.0f, 4.0f);
++    smoke.vz = destructBetween(14.0f, 34.0f);
++    smoke.scale = scale;
++    smoke.growth = destructBetween(0.25f, 0.5f) * scale;
++    smoke.opacity = opacity;
++    smoke.color = color;
++    smoke.delay = delay;
++    smoke.life = life;
++    destructAddParticle(std::move(smoke));
++}
++
++// Whether the floor goes on all around the tile, so that taking away what
++// stands there doesn't open a hole into the black.
++static bool destructGroundAround(int tile, int elevation)
++{
++    int x;
++    int y;
++    if (!destructTileCenter(tile, elevation, &x, &y)) {
++        return false;
++    }
++
++    const int offsets[9][2] = { { 0, 0 }, { -32, -8 }, { 32, 8 }, { -32, 8 }, { 32, -8 }, { 0, -16 }, { 0, 16 }, { -48, 0 }, { 48, 0 } };
++    for (const auto& offset : offsets) {
++        if (destructFloorPixel(x + offset[0], y + offset[1], elevation) == 0) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static void destructPile(const DestructFrame& frame, int tile, int elevation, const unsigned char* colors, DestructMaterial material)
++{
++    // Glass leaves only its glints.
++    if (material == DESTRUCT_GLASS) {
++        return;
++    }
++    const char* kinds[] = { "pile", "pilew", "pilem", "", "pilec" };
++    std::string prefix = std::string(kinds[material]) + (frame.width >= 44 ? "l" : "s");
++    std::string name;
++    const DestructSprite* sprite = destructSpriteVariant(prefix.c_str(), &name);
++    if (sprite == nullptr) {
++        sprite = destructSpriteVariant(frame.width >= 44 ? "pilel" : "piles", &name);
++    }
++    if (sprite == nullptr) {
++        return;
++    }
++
++    Decal pile;
++    pile.kind = DECAL_PILE;
++    pile.elevation = elevation;
++    pile.tile = tile;
++    pile.x = 16 - sprite->anchorX + (int)destructBetween(-3.0f, 3.0f);
++    pile.y = 8 - sprite->anchorY + (int)destructBetween(-2.0f, 2.0f);
++    pile.sprite = name;
++    pile.frame = destructPick(sprite->frames);
++    memcpy(pile.colors, colors, sizeof(pile.colors));
++    pile.width = 0;
++    pile.height = 0;
++    pile.resolved = nullptr;
++    destructAddDecal(std::move(pile));
++}
++
++static uint64_t destructDamageKey(int elevation, int tile, int fid)
++{
++    return ((uint64_t)(uint32_t)fid << 32) | ((uint64_t)elevation << 24) | (uint32_t)tile;
++}
++
++static std::vector<Damage>* destructCurrentDamage()
++{
++    auto it = gDestructDamage.find(gDestructMap);
++    return it != gDestructDamage.end() && !it->second.empty() ? &(it->second) : nullptr;
++}
++
++static void destructIndexDamage()
++{
++    if (!gDamageIndexDirty) {
++        return;
++    }
++    gDamageIndex.clear();
++    std::vector<Damage>* list = destructCurrentDamage();
++    if (list != nullptr) {
++        for (size_t index = 0; index < list->size(); index++) {
++            const Damage& damage = (*list)[index];
++            gDamageIndex[destructDamageKey(damage.elevation, damage.tile, damage.fid)] = index;
++        }
++    }
++    gDamageIndexDirty = false;
++}
++
++static Damage* destructFindDamage(Object* object)
++{
++    if (destructCurrentDamage() == nullptr) {
++        return nullptr;
++    }
++    destructIndexDamage();
++    auto it = gDamageIndex.find(destructDamageKey(object->elevation, object->tile, object->fid));
++    return it != gDamageIndex.end() ? &((*destructCurrentDamage())[it->second]) : nullptr;
++}
++
++static void destructForgetDamage(Object* object)
++{
++    std::vector<Damage>* list = destructCurrentDamage();
++    if (list == nullptr) {
++        return;
++    }
++    list->erase(std::remove_if(list->begin(), list->end(), [object](const Damage& damage) {
++        return damage.elevation == object->elevation && damage.tile == object->tile && damage.fid == object->fid;
++    }),
++        list->end());
++    gDamageIndexDirty = true;
++}
++
++const unsigned char* destructDamagedFrame(Object* object, const unsigned char* data, int width, int height)
++{
++    if (!gDestructInitialized || data == nullptr) {
++        return nullptr;
++    }
++
++    Damage* damage = destructFindDamage(object);
++    if (damage == nullptr || damage->width != width || damage->height != height) {
++        return nullptr;
++    }
++
++    if (damage->frame != object->frame || damage->rotation != object->rotation || damage->pixels.empty()) {
++        damage->pixels.resize((size_t)width * height);
++        for (size_t index = 0; index < damage->pixels.size(); index++) {
++            unsigned char color = data[index];
++            unsigned char mark = damage->mask[index];
++            if (color == 0 || mark == kGone) {
++                color = 0;
++            } else if (mark != 0 && color < kGlowStart) {
++                color = intensityColorTable[color][mark];
++                if (color == 0) {
++                    color = gDestructDark;
++                }
++            }
++            damage->pixels[index] = color;
++        }
++        damage->frame = object->frame;
++        damage->rotation = object->rotation;
++    }
++
++    return damage->pixels.data();
++}
++
++// Smooth noise in 0..1 with features about `size` pixels across.
++static float destructNoise(float x, float y, float size, int seed)
++{
++    x /= size;
++    y /= size;
++    int left = (int)floorf(x);
++    int top = (int)floorf(y);
++    float fx = x - left;
++    float fy = y - top;
++    fx = fx * fx * (3 - 2 * fx);
++    fy = fy * fy * (3 - 2 * fy);
++    auto value = [seed](int cx, int cy) {
++        return (destructHash(cx * 31 + seed, cy * 17 - seed) & 0xFFFF) / 65535.0f;
++    };
++    float a = value(left, top) + (value(left + 1, top) - value(left, top)) * fx;
++    float b = value(left, top + 1) + (value(left + 1, top + 1) - value(left, top + 1)) * fx;
++    return a + (b - a) * fy;
++}
++
++// Marks in `reached` what hangs together, 8 ways, with what `reached`
++// already marks, over the pixels `alive` marks.
++static void destructFlood(const std::vector<unsigned char>& alive, int width, int height, std::vector<unsigned char>& reached)
++{
++    std::vector<int> stack;
++    for (int index = 0; index < width * height; index++) {
++        if (reached[index] != 0) {
++            stack.push_back(index);
++        }
++    }
++    while (!stack.empty()) {
++        int index = stack.back();
++        stack.pop_back();
++        int x = index % width;
++        int y = index / width;
++        for (int dy = -1; dy <= 1; dy++) {
++            for (int dx = -1; dx <= 1; dx++) {
++                int nx = x + dx;
++                int ny = y + dy;
++                if (nx < 0 || ny < 0 || nx >= width || ny >= height) {
++                    continue;
++                }
++                int next = ny * width + nx;
++                if (alive[next] != 0 && reached[next] == 0) {
++                    reached[next] = 1;
++                    stack.push_back(next);
++                }
++            }
++        }
++    }
++}
++
++#ifdef WRECKED_TEST
++static float gDebugNearest = 0.0f;
++#endif
++
++// Takes a ragged bite out of the object around `blastX`, `blastY` (screen),
++// soots what is left near it and lights the bite's edges. `collapse` also
++// brings down what stands above a ragged line near the foot, as wide as the
++// bite, so that a hole runs across wall pieces without seams. `removed` gets
++// the art that came off; returns the share of the art still standing.
++static float destructDamageObject(Object* object, const DestructFrame& frame, float blastX, float blastY, float radius, bool remove, bool collapse, DestructMaterial material, DestructFrame* removed)
++{
++#ifdef WRECKED_TEST
++    gDebugNearest = 1e9f;
++#endif
++    bool wall = FID_TYPE(object->fid) == OBJ_TYPE_WALL || frame.height > 56;
++    Damage* damage = destructFindDamage(object);
++    if (damage == nullptr || damage->width != frame.width || damage->height != frame.height) {
++        if (damage != nullptr) {
++            destructForgetDamage(object);
++        }
++        std::vector<Damage>& list = gDestructDamage[gDestructMap];
++        Damage fresh;
++        fresh.elevation = object->elevation;
++        fresh.tile = object->tile;
++        fresh.fid = object->fid;
++        fresh.width = frame.width;
++        fresh.height = frame.height;
++        fresh.mask.assign((size_t)frame.width * frame.height, 0);
++        fresh.frame = -1;
++        fresh.rotation = -1;
++        list.push_back(std::move(fresh));
++        gDamageIndexDirty = true;
++        damage = &(list.back());
++    }
++
++    int seed = object->tile * 7 + object->fid;
++    int width = frame.width;
++    int height = frame.height;
++    std::vector<unsigned char>& mask = damage->mask;
++
++    *removed = frame;
++    std::fill(removed->pixels.begin(), removed->pixels.end(), 0);
++
++    // The foot of each column, for a collapse.
++    std::vector<int> foot(width, -1);
++    if (wall) {
++        for (int x = 0; x < width; x++) {
++            for (int y = height - 1; y >= 0; y--) {
++                if (frame.pixels[y * width + x] != 0) {
++                    foot[x] = y;
++                    break;
++                }
++            }
++        }
++    }
++
++    std::vector<float> reach((size_t)width * height, 0.0f);
++    int total = 0;
++    int standing = 0;
++    for (int y = 0; y < height; y++) {
++        for (int x = 0; x < width; x++) {
++            size_t index = (size_t)y * width + x;
++            if (frame.pixels[index] == 0) {
++                continue;
++            }
++            total++;
++            if (mask[index] == kGone) {
++                continue;
++            }
++
++            float screenX = (float)(frame.left + x);
++            float screenY = (float)(frame.top + y);
++            float dx = (screenX - blastX) / (radius * 1.25f);
++            float dy = (screenY - blastY) / radius;
++            float rough = 0.6f * destructNoise(screenX, screenY, 7.0f, 21) + 0.4f * destructNoise(screenX, screenY, 1.8f, 22);
++            // Distance from the blast in units of the bite's ragged edge.
++            float distance = sqrtf(dx * dx + dy * dy) / (0.72f + 0.56f * rough);
++            reach[index] = distance;
++#ifdef WRECKED_TEST
++            gDebugNearest = std::min(gDebugNearest, distance);
++#endif
++
++            bool gone = remove && distance < 1.0f;
++            // Masonry keeps a ragged foot; boards, sheets and cloth come
++            // down whole.
++            bool footed = material == DESTRUCT_STONE;
++            if (gone && footed && foot[x] != -1 && y >= foot[x] - 3 - (int)(5.0f * destructNoise(screenX, 0.0f, 6.0f, 15) + 3.0f * destructNoise(screenX, 0.0f, 1.5f, 16))) {
++                gone = false;
++            }
++            if (collapse && foot[x] != -1) {
++                // The noise follows the screen, not the piece, so that
++                // neighbouring pieces break along one line.
++                float side = fabsf(screenX - blastX) / (radius * 1.25f * (0.7f + 0.5f * destructNoise(0.0f, screenY, 6.0f, 11) + 0.3f * destructNoise(0.0f, screenY, 1.5f, 12)));
++                float keep = 7.0f + 16.0f * destructNoise(screenX, 0.0f, 9.0f, 13) + 3.0f * destructNoise(screenX, 0.0f, 2.0f, 14);
++                gone = gone || (side < 1.0f && (!footed || y < foot[x] - (int)keep));
++            }
++
++            if (gone) {
++                mask[index] = kGone;
++                removed->pixels[index] = frame.pixels[index];
++            } else {
++                standing++;
++            }
++        }
++    }
++
++    // What no longer hangs together with the foot of the art falls too: a
++    // bite can leave the top of a wall in the air. Bits that don't touch the
++    // foot in the whole art either stay.
++    if (remove || collapse) {
++        std::vector<int> bottom(width, -1);
++        for (int x = 0; x < width; x++) {
++            for (int y = height - 1; y >= 0; y--) {
++                if (frame.pixels[y * width + x] != 0) {
++                    bottom[x] = y;
++                    break;
++                }
++            }
++        }
++        size_t size = (size_t)width * height;
++        std::vector<unsigned char> whole(size);
++        std::vector<unsigned char> alive(size);
++        std::vector<unsigned char> held(size, 0);
++        std::vector<unsigned char> heldWhole(size, 0);
++        for (size_t index = 0; index < size; index++) {
++            int x = (int)(index % width);
++            int y = (int)(index / width);
++            whole[index] = frame.pixels[index] != 0;
++            alive[index] = whole[index] && mask[index] != kGone;
++            bool foot = bottom[x] != -1 && y >= bottom[x] - 4;
++            heldWhole[index] = whole[index] && foot;
++            held[index] = alive[index] && foot;
++        }
++        destructFlood(whole, width, height, heldWhole);
++        destructFlood(alive, width, height, held);
++        for (size_t index = 0; index < size; index++) {
++            if (alive[index] && !held[index] && heldWhole[index]) {
++                mask[index] = kGone;
++                removed->pixels[index] = frame.pixels[index];
++                standing--;
++            }
++        }
++    }
++
++    auto isGone = [&](int x, int y) {
++        if (x < 0 || y < 0 || x >= width || y >= height) {
++            return false;
++        }
++        size_t index = (size_t)y * width + x;
++        return frame.pixels[index] != 0 && mask[index] == kGone;
++    };
++
++    for (int y = 0; y < height; y++) {
++        for (int x = 0; x < width; x++) {
++            size_t index = (size_t)y * width + x;
++            if (frame.pixels[index] == 0 || mask[index] == kGone) {
++                continue;
++            }
++
++            int level = mask[index] != 0 ? mask[index] : 128;
++
++            // Soot, heaviest close to the blast.
++            float distance = reach[index];
++            if (distance < 2.4f) {
++                float soot = std::clamp((2.4f - distance) / 1.3f, 0.0f, 1.0f);
++                float patchy = 0.55f + 0.45f * destructNoise((float)(frame.left + x), (float)(frame.top + y), 4.0f, seed + 4);
++                level = std::min(level, 128 - (int)(88.0f * soot * patchy));
++            }
++
++            // Broken edges: what faces up catches the light, the rest is in
++            // shadow, which makes the wall look as thick as it is.
++            if (isGone(x, y - 1)) {
++                level = 176;
++            } else if (isGone(x, y - 2)) {
++                level = 150;
++            } else if (isGone(x - 1, y) || isGone(x + 1, y) || isGone(x, y + 1)) {
++                level = std::min(level, 58);
++            } else if (isGone(x - 2, y) || isGone(x + 2, y) || isGone(x, y + 2)) {
++                level = std::min(level, 88);
++            }
++
++            mask[index] = level == 128 ? 0 : (unsigned char)std::clamp(level, 1, 254);
++        }
++    }
++
++    damage->frame = -1;
++    return total > 0 ? (float)standing / total : 0.0f;
++}
++
++static void destructDust(int tile, int elevation, const DestructFrame& frame, int blastX, int blastY, const unsigned char* colors, int count)
++{
++    int dustR = 0;
++    int dustG = 0;
++    int dustB = 0;
++    for (int index = 0; index < 8; index++) {
++        int r;
++        int g;
++        int b;
++        destructColorRgb(colors[index], &r, &g, &b);
++        dustR += r;
++        dustG += g;
++        dustB += b;
++    }
++    unsigned char dust = destructNearest(dustR / 8 + 20, dustG / 8 + 18, dustB / 8 + 14);
++    for (int index = 0; index < count; index++) {
++        destructSmoke(tile, elevation,
++            (float)(frame.groundX - blastX) + destructBetween(-14.0f, 14.0f),
++            (float)(frame.groundY - blastY) + destructBetween(-4.0f, 4.0f),
++            destructBetween(4.0f, frame.height * 0.5f),
++            dust, 0.6f, destructBetween(0.45f, 0.8f), destructBetween(0.05f, 0.4f), destructBetween(1.6f, 2.8f));
++    }
++}
++
++// Chunks of what broke, in its colors: stones, boards, bent sheets of metal
++// or rags; glass flies apart in glints. `frame` is the art that came off,
++// `anchor` the blast's tile. Metal throws sparks.
++static void destructMaterialDebris(const DestructFrame& frame, int anchor, int elevation, float power, const unsigned char* colors, DestructMaterial material)
++{
++    int anchorX;
++    int anchorY;
++    if (!destructTileCenter(anchor, elevation, &anchorX, &anchorY)) {
++        return;
++    }
++
++    std::vector<int> opaque;
++    for (int index = 0; index < frame.width * frame.height; index++) {
++        if (frame.pixels[index] != 0) {
++            opaque.push_back(index);
++        }
++    }
++    if (opaque.empty()) {
++        return;
++    }
++
++    float amount = gDestructConfig.debris / 100.0f;
++    const char* kinds[] = { "rock", "plank", "shard", "", "scrap" };
++    int count = material == DESTRUCT_GLASS
++        ? std::clamp((int)opaque.size() / 25, 6, 40)
++        : std::clamp((int)opaque.size() / 120, 2, 14);
++    count = (int)(count * amount);
++
++    for (int index = 0; index < count; index++) {
++        int pixel = opaque[destructPick((int)opaque.size())];
++        int x = frame.left + pixel % frame.width;
++        int y = frame.top + pixel / frame.width;
++        unsigned char color = colors[2 + destructPick(5)];
++
++        Particle chunk = destructNewParticle(PARTICLE_CHUNK, anchor, elevation);
++        if (material == DESTRUCT_GLASS) {
++            chunk.kind = PARTICLE_PIECE;
++            chunk.width = 1 + destructPick(2);
++            chunk.height = 1;
++            chunk.pixels.assign(chunk.width, frame.pixels[pixel] < kGlowStart ? frame.pixels[pixel] : color);
++            chunk.spin = destructBetween(6.0f, 14.0f);
++        } else {
++            const DestructSprite* sprite = destructSpriteVariant(kinds[material]);
++            if (sprite == nullptr) {
++                return;
++            }
++            chunk.sprite = sprite;
++            chunk.color = color;
++            chunk.frame = destructPick(sprite->frames);
++            chunk.spin = material == DESTRUCT_CLOTH ? destructBetween(3.0f, 7.0f) : destructBetween(8.0f, 20.0f);
++        }
++        chunk.material = material;
++        chunk.variant = destructPick(8);
++        chunk.x = (float)(x - anchorX);
++        chunk.y = (float)(frame.groundY - anchorY) + destructBetween(-3.0f, 3.0f);
++        chunk.z = (float)std::max(0, frame.groundY - y);
++        destructLaunch(&chunk, 0.0f, 0.0f, destructBetween(40.0f, 180.0f) * power, destructBetween(60.0f, 260.0f) * power);
++        chunk.keep = true;
++        destructAddParticle(std::move(chunk));
++    }
++
++    if (material == DESTRUCT_METAL) {
++        int sparks = (int)((6 + 8 * power) * amount);
++        for (int index = 0; index < sparks; index++) {
++            int pixel = opaque[destructPick((int)opaque.size())];
++            Particle spark = destructNewParticle(PARTICLE_SPARK, anchor, elevation);
++            spark.variant = destructPick(5);
++            spark.x = (float)(frame.left + pixel % frame.width - anchorX);
++            spark.y = (float)(frame.groundY - anchorY);
++            spark.z = (float)std::max(2, frame.groundY - (frame.top + pixel / frame.width));
++            float angle = destructBetween(0.0f, 6.2831853f);
++            float speed = destructBetween(60.0f, 220.0f);
++            spark.vx = cosf(angle) * speed;
++            spark.vy = sinf(angle) * speed * 0.5f;
++            spark.vz = destructBetween(40.0f, 220.0f);
++            spark.life = destructBetween(0.25f, 0.7f);
++            destructAddParticle(std::move(spark));
++        }
++    }
++}
++
++// Puffs of dust for what broke: stone and earth crumble into a lot of it.
++static int destructDustCount(DestructMaterial material, int stone)
++{
++    switch (material) {
++    case DESTRUCT_STONE:
++        return stone;
++    case DESTRUCT_WOOD:
++    case DESTRUCT_CLOTH:
++        return std::max(1, stone / 2);
++    default:
++        return 0;
++    }
++}
++
++static bool destructMapBlocked()
++{
++    return std::find(gDestructConfig.blockedMaps.begin(), gDestructConfig.blockedMaps.end(), gDestructMap) != gDestructConfig.blockedMaps.end();
++}
++
++static RoofDamage* destructFindRoof(int elevation, int square)
++{
++    auto map = gDestructRoofs.find(gDestructMap);
++    if (map == gDestructRoofs.end()) {
++        return nullptr;
++    }
++    auto it = map->second.find(elevation * SQUARE_GRID_SIZE + square);
++    return it != map->second.end() ? &(it->second) : nullptr;
++}
++
++const unsigned char* destructDamagedRoof(int elevation, int square, int fid, const unsigned char* data, int width, int height)
++{
++    if (!gDestructInitialized || data == nullptr || gDestructRoofs.empty()) {
++        return nullptr;
++    }
++
++    RoofDamage* damage = destructFindRoof(elevation, square);
++    if (damage == nullptr || damage->fid != fid || damage->width != width || damage->height != height) {
++        return nullptr;
++    }
++
++    if (damage->pixels.empty()) {
++        damage->pixels.resize((size_t)width * height);
++        for (size_t index = 0; index < damage->pixels.size(); index++) {
++            unsigned char color = data[index];
++            unsigned char mark = damage->mask[index];
++            if (color == 0 || mark == kGone) {
++                color = 0;
++            } else if (mark != 0 && color < kGlowStart) {
++                color = intensityColorTable[color][mark];
++                if (color == 0) {
++                    color = gDestructDark;
++                }
++            }
++            damage->pixels[index] = color;
++        }
++    }
++
++    return damage->pixels.data();
++}
++
++// Brings down the roof around the blast (a wall gave way, the beam, a
++// meteor): a ragged hole `radius` screen pixels across the ground, with
++// sooted, broken edges, only where there is a floor under it to show. Roof
++// the hole cuts off from the rest comes down too, all of it in pieces.
++static void destructBreakRoof(int tile, int elevation, int blastX, int blastY, float radius, float power, Rect* dirty, bool* anyDirty)
++{
++    Rect area;
++    area.left = blastX - (int)(radius * 2.0f);
++    area.right = blastX + (int)(radius * 2.0f);
++    area.top = blastY - kRoofHeight - (int)radius;
++    area.bottom = blastY - kRoofHeight + (int)radius;
++
++    // Roof that touches the edge of this region is held by the rest.
++    const int margin = 48;
++    Rect region = { area.left - margin, area.top - margin, area.right + margin, area.bottom + margin };
++    int regionWidth = region.right - region.left + 1;
++    int regionHeight = region.bottom - region.top + 1;
++
++    int corners[4][2] = { { region.left, region.top }, { region.right, region.top }, { region.left, region.bottom }, { region.right, region.bottom } };
++    int minX = INT32_MAX;
++    int minY = INT32_MAX;
++    int maxX = INT32_MIN;
++    int maxY = INT32_MIN;
++    for (const auto& corner : corners) {
++        int x;
++        int y;
++        squareTileScreenToCoordRoof(corner[0], corner[1], elevation, &x, &y);
++        minX = std::min(minX, x);
++        minY = std::min(minY, y);
++        maxX = std::max(maxX, x);
++        maxY = std::max(maxY, y);
++    }
++    minX = std::max(0, minX - 1);
++    minY = std::max(0, minY - 1);
++    maxX = std::min(SQUARE_GRID_WIDTH - 1, maxX + 1);
++    maxY = std::min(SQUARE_GRID_HEIGHT - 1, maxY + 1);
++
++    struct Piece {
++        int square;
++        int fid;
++        bool visible;
++        Rect rect;
++        CacheEntry* handle;
++        const unsigned char* data;
++        RoofDamage fresh;
++        RoofDamage* damage;
++        std::vector<unsigned char> before;
++        std::vector<float> reach;
++    };
++    std::vector<Piece> pieces;
++
++    std::unordered_map<int, RoofDamage>& roofs = gDestructRoofs[gDestructMap];
++    int emptyFid = buildFid(OBJ_TYPE_TILE, 1, 0, 0, 0);
++
++    // In the order the game draws roofs, so that where squares overlap the
++    // one on top counts.
++    for (int squareY = minY; squareY <= maxY; squareY++) {
++        for (int squareX = minX; squareX <= maxX; squareX++) {
++            int square = squareY * SQUARE_GRID_WIDTH + squareX;
++            int roof = (_square[elevation]->field_0[square] >> 16) & 0xFFFF;
++            int fid = buildFid(OBJ_TYPE_TILE, roof & 0xFFF, 0, 0, 0);
++            if (fid == emptyFid) {
++                continue;
++            }
++
++            int roofX;
++            int roofY;
++            if (squareTileToRoofScreenXY(square, &roofX, &roofY, elevation) != 0) {
++                continue;
++            }
++
++            Piece piece;
++            Art* art = artLock(fid, &(piece.handle));
++            if (art == nullptr) {
++                continue;
++            }
++            int width = artGetWidth(art, 0, 0);
++            int height = artGetHeight(art, 0, 0);
++            piece.data = artGetFrameData(art, 0, 0);
++            piece.rect = { roofX, roofY, roofX + width - 1, roofY + height - 1 };
++            Rect overlap;
++            if (piece.data == nullptr || rectIntersection(&(piece.rect), &region, &overlap) != 0) {
++                artUnlock(piece.handle);
++                continue;
++            }
++
++            piece.square = square;
++            piece.fid = fid;
++            // Hidden while the player is under it.
++            piece.visible = (((roof & 0xF000) >> 12) & 0x01) == 0;
++            pieces.push_back(std::move(piece));
++        }
++    }
++
++    for (Piece& piece : pieces) {
++        int width = piece.rect.right - piece.rect.left + 1;
++        int height = piece.rect.bottom - piece.rect.top + 1;
++        auto it = roofs.find(elevation * SQUARE_GRID_SIZE + piece.square);
++        if (it != roofs.end() && it->second.fid == piece.fid && it->second.width == width && it->second.height == height) {
++            piece.damage = &(it->second);
++        } else {
++            piece.fresh.fid = piece.fid;
++            piece.fresh.width = width;
++            piece.fresh.height = height;
++            piece.fresh.mask.assign((size_t)width * height, 0);
++            piece.damage = &(piece.fresh);
++        }
++        piece.before = piece.damage->mask;
++        piece.reach.assign((size_t)width * height, 9.0f);
++
++        std::vector<unsigned char>& mask = piece.damage->mask;
++        for (int y = 0; y < height; y++) {
++            for (int x = 0; x < width; x++) {
++                size_t index = (size_t)y * width + x;
++                if (piece.data[index] == 0 || mask[index] == kGone) {
++                    continue;
++                }
++                // The ground under this bit of roof.
++                float groundX = (float)(piece.rect.left + x);
++                float groundY = (float)(piece.rect.top + y + kRoofHeight);
++                float dx = (groundX - blastX) / radius;
++                float dy = (groundY - blastY) * 2.0f / radius;
++                float rough = 0.6f * destructNoise(groundX, groundY, 7.0f, 31) + 0.4f * destructNoise(groundX, groundY, 1.8f, 32);
++                float distance = sqrtf(dx * dx + dy * dy) / (0.72f + 0.56f * rough);
++                piece.reach[index] = distance;
++                if (distance < 1.0f && destructFloorPixel((int)groundX, (int)groundY, elevation) != 0) {
++                    mask[index] = kGone;
++                }
++            }
++        }
++    }
++
++    // The roof as drawn over the region: which piece owns each pixel.
++    size_t regionSize = (size_t)regionWidth * regionHeight;
++    std::vector<int> owner(regionSize, -1);
++    for (int index = 0; index < (int)pieces.size(); index++) {
++        const Piece& piece = pieces[index];
++        int width = piece.rect.right - piece.rect.left + 1;
++        for (int y = std::max(piece.rect.top, region.top); y <= std::min(piece.rect.bottom, region.bottom); y++) {
++            for (int x = std::max(piece.rect.left, region.left); x <= std::min(piece.rect.right, region.right); x++) {
++                if (piece.data[(size_t)(y - piece.rect.top) * width + (x - piece.rect.left)] != 0) {
++                    owner[(size_t)(y - region.top) * regionWidth + (x - region.left)] = index;
++                }
++            }
++        }
++    }
++
++    std::vector<unsigned char> whole(regionSize, 0);
++    std::vector<unsigned char> alive(regionSize, 0);
++    std::vector<unsigned char> held(regionSize, 0);
++    std::vector<unsigned char> heldWhole(regionSize, 0);
++    auto local = [&](size_t index) {
++        const Piece& piece = pieces[owner[index]];
++        int width = piece.rect.right - piece.rect.left + 1;
++        int x = region.left + (int)(index % regionWidth) - piece.rect.left;
++        int y = region.top + (int)(index / regionWidth) - piece.rect.top;
++        return (size_t)y * width + x;
++    };
++    for (size_t index = 0; index < regionSize; index++) {
++        if (owner[index] == -1) {
++            continue;
++        }
++        int x = (int)(index % regionWidth);
++        int y = (int)(index / regionWidth);
++        bool edge = x == 0 || y == 0 || x == regionWidth - 1 || y == regionHeight - 1;
++        whole[index] = 1;
++        alive[index] = pieces[owner[index]].damage->mask[local(index)] != kGone;
++        heldWhole[index] = edge;
++        held[index] = edge && alive[index];
++    }
++    destructFlood(whole, regionWidth, regionHeight, heldWhole);
++    destructFlood(alive, regionWidth, regionHeight, held);
++    for (size_t index = 0; index < regionSize; index++) {
++        if (alive[index] && !held[index] && heldWhole[index]) {
++            pieces[owner[index]].damage->mask[local(index)] = kGone;
++        }
++    }
++
++    for (Piece& piece : pieces) {
++        int width = piece.rect.right - piece.rect.left + 1;
++        int height = piece.rect.bottom - piece.rect.top + 1;
++        std::vector<unsigned char>& mask = piece.damage->mask;
++        const unsigned char* data = piece.data;
++
++        auto isGone = [&](int x, int y) {
++            if (x < 0 || y < 0 || x >= width || y >= height) {
++                return false;
++            }
++            size_t index = (size_t)y * width + x;
++            return data[index] != 0 && mask[index] == kGone;
++        };
++
++        for (int y = 0; y < height; y++) {
++            for (int x = 0; x < width; x++) {
++                size_t index = (size_t)y * width + x;
++                if (data[index] == 0 || mask[index] == kGone) {
++                    continue;
++                }
++                int level = mask[index] != 0 ? mask[index] : 128;
++                if (piece.reach[index] < 1.8f) {
++                    float soot = std::clamp((1.8f - piece.reach[index]) / 1.0f, 0.0f, 1.0f);
++                    float patchy = 0.55f + 0.45f * destructNoise((float)(piece.rect.left + x), (float)(piece.rect.top + y), 4.0f, 33);
++                    level = std::min(level, 128 - (int)(80.0f * soot * patchy));
++                }
++                // The far side of the hole shows the roof's broken
++                // thickness, the near side a lit lip.
++                if (isGone(x, y + 1)) {
++                    level = std::min(level, 62);
++                } else if (isGone(x, y + 2)) {
++                    level = std::min(level, 86);
++                } else if (isGone(x, y - 1)) {
++                    level = 160;
++                } else if (isGone(x - 1, y) || isGone(x + 1, y)) {
++                    level = std::min(level, 80);
++                }
++                mask[index] = level == 128 ? 0 : (unsigned char)std::clamp(level, 1, 254);
++            }
++        }
++
++        DestructFrame removed;
++        removed.left = piece.rect.left;
++        removed.top = piece.rect.top;
++        removed.width = width;
++        removed.height = height;
++        removed.groundX = piece.rect.left + width / 2;
++        removed.groundY = piece.rect.bottom + kRoofHeight;
++        removed.pixels.assign((size_t)width * height, 0);
++        int gone = 0;
++        for (size_t index = 0; index < mask.size(); index++) {
++            if (mask[index] == kGone && piece.before[index] != kGone && data[index] != 0) {
++                removed.pixels[index] = data[index];
++                gone++;
++            }
++        }
++
++        bool changed = mask != piece.before;
++#ifdef WRECKED_TEST
++        if (gone > 0) {
++            fprintf(stderr, "destruct: roof square %d fid %08x at %d,%d visible %d: %d gone\n", piece.square, piece.fid, piece.rect.left, piece.rect.top, piece.visible ? 1 : 0, gone);
++        }
++#endif
++        if (changed) {
++            piece.damage->pixels.clear();
++            if (piece.damage == &(piece.fresh)) {
++                roofs[elevation * SQUARE_GRID_SIZE + piece.square] = std::move(piece.fresh);
++            }
++            if (*anyDirty) {
++                rectUnion(dirty, &(piece.rect), dirty);
++            } else {
++                *dirty = piece.rect;
++                *anyDirty = true;
++            }
++        }
++
++        if (gone > 0 && piece.visible) {
++            unsigned char colors[8];
++            destructFrameColors(removed, colors);
++            // Grey roofs are sheet metal, the rest boards and tar.
++            int r;
++            int g;
++            int b;
++            destructColorRgb(colors[4], &r, &g, &b);
++            DestructMaterial material = std::max({ r, g, b }) - std::min({ r, g, b }) < 20 ? DESTRUCT_METAL : DESTRUCT_WOOD;
++            destructShatter(removed, tile, elevation, 0.0f, 0.0f, power * 0.6f, false, material, true);
++            if (gone > 120) {
++                destructMaterialDebris(removed, tile, elevation, power * 0.4f, colors, material);
++            }
++        }
++    }
++
++    for (Piece& piece : pieces) {
++        artUnlock(piece.handle);
++    }
++}
++
++// Breaks scenery and walls in reach and returns the area to redraw.
++static void destructBreak(int tile, int elevation, int radius, int damage, float power, Rect* dirty, bool* anyDirty)
++{
++    if (destructMapBlocked() || (!gDestructConfig.walls && !gDestructConfig.scenery)) {
++        return;
++    }
++
++    std::vector<Object*> candidates;
++    int centerX = tile % HEX_GRID_WIDTH;
++    int centerY = tile / HEX_GRID_WIDTH;
++    for (int y = centerY - radius; y <= centerY + radius; y++) {
++        for (int x = centerX - radius; x <= centerX + radius; x++) {
++            if (x < 0 || y < 0 || x >= HEX_GRID_WIDTH || y >= HEX_GRID_HEIGHT) {
++                continue;
++            }
++            int other = y * HEX_GRID_WIDTH + x;
++            if (tileDistanceBetween(tile, other) > radius) {
++                continue;
++            }
++            for (Object* object = objectFindFirstAtLocation(elevation, other); object != nullptr; object = objectFindNextAtLocation()) {
++                if (std::find(candidates.begin(), candidates.end(), object) == candidates.end()) {
++                    candidates.push_back(object);
++                }
++            }
++        }
++    }
++
++    int blastX;
++    int blastY;
++    if (!destructTileCenter(tile, elevation, &blastX, &blastY)) {
++        return;
++    }
++
++    // Whether a wall gives way here: then walls in reach come down above the
++    // blast, not just around it.
++    bool wallBroken = false;
++    // How hard the blast hits the wall it hits hardest, against its strength:
++    // the hole is one shape across all the walls it reaches.
++    float wallRatio = 0.0f;
++    for (Object* object : candidates) {
++        if (FID_TYPE(object->fid) != OBJ_TYPE_WALL || object->sid != -1 || PID_TYPE(object->pid) != OBJ_TYPE_WALL || !gDestructConfig.walls) {
++            continue;
++        }
++        CacheEntry* handle;
++        Art* art = artLock(object->fid, &handle);
++        if (art == nullptr) {
++            continue;
++        }
++        int area = artGetWidth(art, object->frame, object->rotation) * artGetHeight(art, object->frame, object->rotation);
++        artUnlock(handle);
++        int distance = tileDistanceBetween(tile, object->tile);
++        if (!destructGroundAround(object->tile, elevation)) {
++            continue;
++        }
++        float ratio = (float)(damage * (radius + 1 - distance) / (radius + 1)) / (gDestructConfig.wallStrength + area / 400);
++        wallRatio = std::max(wallRatio, ratio);
++        wallBroken = wallBroken || ratio >= 1.0f;
++    }
++    float biteRadius = (15.0f + 21.0f * power) * std::clamp(0.4f + 0.6f * wallRatio, 0.45f, 1.15f);
++    // A wall came down: the roof over it goes too.
++    bool roofFall = false;
++
++    for (Object* object : candidates) {
++        int type = FID_TYPE(object->fid);
++        if (object->elevation != elevation || object->sid != -1 || (object->flags & OBJECT_HIDDEN) != 0 || object == gDude) {
++            continue;
++        }
++
++        // Flat scenery is rugs, puddles and the like; walls can be flat too.
++        bool wall = type == OBJ_TYPE_WALL;
++        if (!wall && (object->flags & OBJECT_FLAT) != 0) {
++            continue;
++        }
++        if (wall) {
++            if (!gDestructConfig.walls || PID_TYPE(object->pid) != OBJ_TYPE_WALL) {
++                continue;
++            }
++        } else if (type == OBJ_TYPE_SCENERY) {
++            Proto* proto;
++            if (!gDestructConfig.scenery || PID_TYPE(object->pid) != OBJ_TYPE_SCENERY || protoGetProto(object->pid, &proto) == -1 || proto->scenery.type != SCENERY_TYPE_GENERIC) {
++                continue;
++            }
++        } else {
++            continue;
++        }
++
++        DestructFrame frame;
++        if (!destructObjectFrame(object, &frame) || frame.width * frame.height > 170 * 170) {
++#ifdef WRECKED_TEST
++            fprintf(stderr, "destruct: kept %08x at %d: art %dx%d\n", object->fid, object->tile, frame.width, frame.height);
++#endif
++            continue;
++        }
++
++        int distance = tileDistanceBetween(tile, object->tile);
++        int received = damage * (radius + 1 - distance) / (radius + 1);
++        int strength = wall
++            ? gDestructConfig.wallStrength + frame.width * frame.height / 400
++            : gDestructConfig.sceneryStrength + frame.width * frame.height / 250;
++
++        // A hole in a wall with no floor behind it would open onto the black.
++        bool open = !wall || destructGroundAround(object->tile, elevation);
++        bool broken = received >= strength && open;
++        bool bitten = open && (wall ? wallRatio >= 0.5f : received * 2 >= strength);
++
++        // Out of reach of even the soot.
++        float reachX = biteRadius * 1.25f * 1.28f * 2.4f;
++        float reachY = biteRadius * 1.28f * 2.4f;
++        float nearX = std::clamp((float)blastX, (float)frame.left, (float)(frame.left + frame.width - 1)) - blastX;
++        float nearY = std::clamp((float)(blastY - 16), (float)frame.top, (float)(frame.top + frame.height - 1)) - (blastY - 16);
++        if (!broken && (nearX / reachX) * (nearX / reachX) + (nearY / reachY) * (nearY / reachY) >= 1.0f) {
++            continue;
++        }
++
++#ifdef WRECKED_TEST
++        fprintf(stderr, "destruct: %s %s %08x at %d (distance %d, %d against %d, material %d)\n", broken ? "broke" : (bitten ? "bit" : "sooted"), wall ? "wall" : "scenery", object->fid, object->tile, distance, received, strength, (int)destructObjectMaterial(object));
++#endif
++
++        unsigned char colors[8];
++        destructFrameColors(frame, colors);
++        DestructMaterial material = destructObjectMaterial(object);
++        float push = power * (radius + 1 - distance) / (radius + 1) + 0.4f;
++        Rect objectRect = { frame.left, frame.top, frame.left + frame.width - 1, frame.top + frame.height - 1 };
++        bool destroy = false;
++
++        // Big scenery (boarded doors, shelves, machines) breaks like walls do.
++        bool large = !wall && (frame.width * frame.height > 1600 || frame.height > 56);
++        if (broken && !wall && !large) {
++            // Small scenery goes to pieces whole.
++            destructShatter(frame, tile, elevation, 0.0f, 0.0f, push, false, material);
++            destructMaterialDebris(frame, tile, elevation, push, colors, material);
++            destructPile(frame, object->tile, elevation, colors, material);
++            destructDust(tile, elevation, frame, blastX, blastY, colors, destructDustCount(material, 2));
++            destructForgetDamage(object);
++            destroy = true;
++        } else {
++            DestructFrame removed;
++            bool collapse = (wall || large) && (bitten || broken) && (wallBroken || broken);
++            float standing = destructDamageObject(object, frame, (float)blastX, (float)(blastY - 16), wall || large ? biteRadius : 15.0f + 21.0f * power, bitten || (large && broken), collapse, material, &removed);
++            bool any = std::any_of(removed.pixels.begin(), removed.pixels.end(), [](unsigned char color) {
++                return color != 0;
++            });
++#ifdef WRECKED_TEST
++            fprintf(stderr, "destruct:   %08x art %dx%d at %d,%d, blast %d,%d radius %.1f nearest %.2f, removed %d, standing %.2f\n", object->fid, frame.width, frame.height, frame.left, frame.top, blastX, blastY - 16, biteRadius, gDebugNearest,
++                (int)std::count_if(removed.pixels.begin(), removed.pixels.end(), [](unsigned char color) { return color != 0; }), standing);
++#endif
++            if (any) {
++                destructShatter(removed, tile, elevation, 0.0f, 0.0f, push, wall, material);
++                destructMaterialDebris(removed, tile, elevation, push, colors, material);
++                destructDust(tile, elevation, frame, blastX, blastY, colors, destructDustCount(material, wall ? 4 : 2));
++                if (wall && collapse) {
++                    roofFall = true;
++                }
++            }
++            if (broken || standing < 0.45f) {
++                // What's left can be climbed over. A pile only for what came
++                // off now, so that later blasts don't stack them.
++                object->flags |= OBJECT_NO_BLOCK | OBJECT_SHOOT_THRU | OBJECT_LIGHT_THRU;
++                if (any) {
++                    destructPile(frame, object->tile, elevation, colors, material);
++                }
++            }
++            if (standing < 0.06f) {
++                destructForgetDamage(object);
++                destroy = true;
++            }
++        }
++
++        if (destroy) {
++            Rect lightRect;
++            if (object->lightIntensity > 0) {
++                objectSetLight(object, 0, 0, &lightRect);
++                rectUnion(&objectRect, &lightRect, &objectRect);
++            }
++            // As scripts destroy objects: whatever animates it stops first.
++            reg_anim_clear(object);
++            Rect destroyRect;
++            objectDestroy(object, &destroyRect);
++            rectUnion(&objectRect, &destroyRect, &objectRect);
++        }
++
++        if (*anyDirty) {
++            rectUnion(dirty, &objectRect, dirty);
++        } else {
++            *dirty = objectRect;
++            *anyDirty = true;
++        }
++    }
++
++#ifdef WRECKED_TEST
++    fprintf(stderr, "destruct: roof fall %d\n", roofFall ? 1 : 0);
++#endif
++    if (roofFall) {
++        destructBreakRoof(tile, elevation, blastX, blastY, biteRadius * 1.1f, power, dirty, anyDirty);
++    }
++}
++
++void destructExplode(int tile, int elevation, int radius, int damage, DestructBlast blast)
++{
++    if (!gDestructInitialized || !gDestructConfig.enabled || !tileIsValid(tile) || elevation < 0 || elevation >= ELEVATION_COUNT) {
++        return;
++    }
++
++    destructPrepareColors();
++
++    if (gBlastMeteor) {
++        radius = 4;
++        damage = 130;
++    }
++    radius = std::clamp(radius, 1, 6);
++    damage = std::max(damage, 1);
++    float power = std::clamp(damage / 40.0f, 0.5f, gBlastMeteor ? 3.0f : 2.0f);
++    float amount = gDestructConfig.debris / 100.0f;
++
++    int centerX;
++    int centerY;
++    if (!destructTileCenter(tile, elevation, &centerX, &centerY)) {
++        return;
++    }
++
++    Rect dirty = { centerX - 1, centerY - 1, centerX + 1, centerY + 1 };
++    bool anyDirty = true;
++
++    if (blast != DESTRUCT_BLAST_EMP) {
++        destructBreak(tile, elevation, radius, damage, power, &dirty, &anyDirty);
++    }
++
++    // The fireball: puffs thrown out and up that cool down into smoke.
++    if (blast != DESTRUCT_BLAST_EMP) {
++        int count = (int)(10 + 6 * power);
++        for (int index = 0; index < count; index++) {
++            const DestructSprite* sprite = destructSpriteVariant("puff");
++            if (sprite == nullptr) {
++                break;
++            }
++            Particle fire = destructNewParticle(PARTICLE_FIRE, tile, elevation);
++            fire.blast = blast;
++            fire.sprite = sprite;
++            fire.frame = destructPick(sprite->frames);
++            fire.x = destructBetween(-8.0f, 8.0f);
++            fire.y = destructBetween(-4.0f, 4.0f);
++            fire.z = destructBetween(2.0f, 14.0f);
++            float angle = destructBetween(0.0f, 6.2831853f);
++            float speed = destructBetween(30.0f, 95.0f) * power;
++            fire.vx = cosf(angle) * speed;
++            fire.vy = sinf(angle) * speed * 0.5f;
++            fire.vz = destructBetween(30.0f, 150.0f) * power;
++            fire.scale = destructBetween(0.3f, 0.5f) * power;
++            fire.growth = destructBetween(0.6f, 1.1f) * power;
++            fire.life = destructBetween(0.45f, 0.8f);
++            fire.delay = index < count / 2 ? 0.0f : destructBetween(0.0f, 0.12f);
++            fire.color = destructNearest(64, 60, 56);
++            destructAddParticle(std::move(fire));
++        }
++    }
++
++    // Sparks and embers.
++    int sparks = (int)(34 * power * amount) + 8;
++    for (int index = 0; index < sparks; index++) {
++        Particle spark = destructNewParticle(PARTICLE_SPARK, tile, elevation);
++        spark.blast = blast;
++        spark.variant = destructPick(5);
++        spark.x = destructBetween(-4.0f, 4.0f);
++        spark.z = destructBetween(4.0f, 16.0f);
++        float angle = destructBetween(0.0f, 6.2831853f);
++        float speed = destructBetween(110.0f, 380.0f) * sqrtf(power);
++        spark.vx = cosf(angle) * speed;
++        spark.vy = sinf(angle) * speed * 0.5f;
++        spark.vz = destructBetween(90.0f, 420.0f) * sqrtf(power);
++        spark.life = destructBetween(0.4f, 1.3f);
++        destructAddParticle(std::move(spark));
++    }
++
++    if (blast != DESTRUCT_BLAST_EMP) {
++        // Ground thrown up: pieces cut from the floor and chunks of its colors.
++        int pieces = (int)(18 * power * amount);
++        for (int index = 0; index < pieces; index++) {
++            Particle piece = destructNewParticle(PARTICLE_PIECE, tile, elevation);
++            piece.width = 2 + destructPick(5);
++            piece.height = 2 + destructPick(4);
++            piece.pixels.assign(piece.width * piece.height, 0);
++            int sourceX = centerX + (int)destructBetween(-16.0f, 16.0f);
++            int sourceY = centerY + (int)destructBetween(-8.0f, 8.0f);
++            bool any = false;
++            for (int y = 0; y < piece.height; y++) {
++                for (int x = 0; x < piece.width; x++) {
++                    float dx = (x + 0.5f) / piece.width - 0.5f;
++                    float dy = (y + 0.5f) / piece.height - 0.5f;
++                    if (dx * dx + dy * dy > 0.3f + (destructHash(x + index, y) & 7) * 0.02f) {
++                        continue;
++                    }
++                    unsigned char color = destructFloorPixel(sourceX + x, sourceY + y, elevation);
++                    piece.pixels[y * piece.width + x] = color;
++                    any = any || color != 0;
++                }
++            }
++            if (!any) {
++                continue;
++            }
++            piece.x = (float)(sourceX - centerX);
++            piece.y = (float)(sourceY - centerY);
++            destructLaunch(&piece, 0.0f, 0.0f, destructBetween(50.0f, 250.0f) * power, destructBetween(110.0f, 360.0f) * power);
++            piece.keep = true;
++            destructAddParticle(std::move(piece));
++        }
++
++        int chunks = (int)(10 * power * amount);
++        for (int index = 0; index < chunks; index++) {
++            const DestructSprite* sprite = destructSpriteVariant("rock");
++            unsigned char color = destructFloorPixel(centerX + (int)destructBetween(-20.0f, 20.0f), centerY + (int)destructBetween(-10.0f, 10.0f), elevation);
++            if (sprite == nullptr || color == 0 || color >= kGlowStart) {
++                continue;
++            }
++            Particle chunk = destructNewParticle(PARTICLE_CHUNK, tile, elevation);
++            chunk.sprite = sprite;
++            chunk.color = color;
++            chunk.x = destructBetween(-10.0f, 10.0f);
++            chunk.y = destructBetween(-5.0f, 5.0f);
++            chunk.frame = destructPick(sprite->frames);
++            chunk.spin = destructBetween(8.0f, 22.0f);
++            destructLaunch(&chunk, 0.0f, 0.0f, destructBetween(40.0f, 200.0f) * power, destructBetween(140.0f, 380.0f) * power);
++            chunk.keep = true;
++            destructAddParticle(std::move(chunk));
++        }
++
++        // Smoke that rises after the fire.
++        int smokes = (int)(4 + 3 * power);
++        for (int index = 0; index < smokes; index++) {
++            destructSmoke(tile, elevation, destructBetween(-14.0f, 14.0f), destructBetween(-6.0f, 6.0f), destructBetween(6.0f, 28.0f),
++                destructNearest(70, 66, 62), 0.55f, destructBetween(0.5f, 0.9f) * power, destructBetween(0.15f, 0.5f), destructBetween(2.4f, 4.0f));
++        }
++
++        // The crater, if there is ground for it and no crater there yet:
++        // stacked ones only get blacker.
++        bool cratered = false;
++        if (std::vector<Decal>* decals = destructCurrentDecals()) {
++            for (const Decal& decal : *decals) {
++                int x;
++                int y;
++                if (decal.kind == DECAL_SHADE && decal.elevation == elevation && destructTileCenter(decal.tile, elevation, &x, &y)
++                    && abs(x - centerX) < 18 && abs(y - centerY) < 9) {
++                    cratered = true;
++                    break;
++                }
++            }
++        }
++        if (gDestructConfig.craters && !cratered && destructFloorPixel(centerX, centerY, elevation) != 0 && !destructMapBlocked()) {
++            const char* size = power < 0.95f ? "craters" : (power < 1.45f ? "craterm" : "craterl");
++            std::string name;
++            const DestructSprite* sprite = destructSpriteVariant(size, &name);
++            if (sprite != nullptr) {
++                Decal crater;
++                crater.kind = DECAL_SHADE;
++                crater.elevation = elevation;
++                crater.tile = tile;
++                crater.x = 16 - sprite->anchorX;
++                crater.y = 8 - sprite->anchorY;
++                crater.sprite = name;
++                crater.frame = destructPick(sprite->frames);
++                memset(crater.colors, 0, sizeof(crater.colors));
++                crater.width = 0;
++                crater.height = 0;
++                crater.resolved = nullptr;
++                Rect craterRect = { centerX - sprite->anchorX, centerY - sprite->anchorY, centerX - sprite->anchorX + sprite->width - 1, centerY - sprite->anchorY + sprite->height - 1 };
++                rectUnion(&dirty, &craterRect, &dirty);
++                destructAddDecal(std::move(crater));
++            }
++        }
++    }
++
++    if (gDestructConfig.flash) {
++        Rect flashRect;
++        if (gFlashTile != -1 && gFlashElevation == elevation && destructFlashRect(&flashRect)) {
++            rectUnion(&dirty, &flashRect, &dirty);
++        }
++        gFlashTile = tile;
++        gFlashElevation = elevation;
++        gFlashAge = 0.0f;
++        gFlashRadius = 45.0f + 30.0f * power;
++        gFlashDirty = true;
++    }
++
++    if (gDestructConfig.shake && blast != DESTRUCT_BLAST_EMP) {
++        gShakeStart = SDL_GetTicks();
++        gShakeAmplitude = 1.5f + 2.5f * power;
++    }
++
++    gDestructLastTick = SDL_GetTicks();
++    if (anyDirty && elevation == gElevation) {
++        tileWindowRefreshRect(&dirty, elevation);
++    }
++}
++
++void* destructPrepare(int tile, int elevation, int radius, int damage, DestructBlast blast)
++{
++    if (!gDestructInitialized || !gDestructConfig.enabled) {
++        return nullptr;
++    }
++
++    PendingBlast* pending = &(gPending[gPendingNext]);
++    gPendingNext = (gPendingNext + 1) % kPendingCount;
++    pending->tile = tile;
++    pending->elevation = elevation;
++    pending->radius = radius;
++    pending->damage = damage;
++    pending->blast = blast;
++    pending->meteor = gBlastMeteor;
++    return pending;
++}
++
++int destructExplodeCallback(void* data, void* unused)
++{
++    PendingBlast* pending = (PendingBlast*)data;
++    if (pending != nullptr) {
++        gBlastMeteor = pending->meteor;
++        destructExplode(pending->tile, pending->elevation, pending->radius, pending->damage, pending->blast);
++        gBlastMeteor = false;
++    }
++    return 0;
++}
++
++// The point of the map window under the cursor; over a roof, the ground
++// the roof covers, which is drawn that much lower.
++static bool destructCursorGround(int* x, int* y, int elevation, float* lift = nullptr)
++{
++    int mouseX;
++    int mouseY;
++    mouseGetPosition(&mouseX, &mouseY);
++    Rect isoRect;
++    if (windowGetRect(gIsoWindow, &isoRect) != 0) {
++        return false;
++    }
++    *x = mouseX - isoRect.left;
++    *y = mouseY - isoRect.top;
++    if (*x < 0 || *y < 0 || *x >= gDestructWidth || *y >= gDestructHeight) {
++        return false;
++    }
++    // A hole broken in the roof is still aimed at as the roof, as what hits
++    // there is drawn at the roof.
++    bool roof = tileRoofCovers(mouseX, mouseY, elevation);
++    if (roof) {
++        *y += kRoofHeight;
++    }
++    if (lift != nullptr) {
++        *lift = roof ? (float)kRoofHeight : 0.0f;
++    }
++    return true;
++}
++
++// How far above this point of the ground what falls from the sky is drawn
++// hitting: the height of the roof over it, if there is one.
++static float destructRoofLift(int x, int y, int elevation)
++{
++    return tileRoofCovers(x, y - kRoofHeight, elevation) ? (float)kRoofHeight : 0.0f;
++}
++
++static bool destructBeamPoint(int* x, int* y)
++{
++    int anchorX;
++    int anchorY;
++    if (!destructTileCenter(gBeam.anchor, gBeam.elevation, &anchorX, &anchorY)) {
++        return false;
++    }
++    *x = anchorX + (int)floorf(gBeam.x);
++    *y = anchorY + (int)floorf(gBeam.y);
++    return true;
++}
++
++// Where the beam is drawn hitting.
++static bool destructBeamDrawPoint(int* x, int* y)
++{
++    if (!destructBeamPoint(x, y)) {
++        return false;
++    }
++    *y -= (int)lroundf(gBeam.lift);
++    return true;
++}
++
++static int destructBeamTile()
++{
++    int x;
++    int y;
++    if (!destructBeamPoint(&x, &y)) {
++        return -1;
++    }
++    return tileFromScreenXY(x, y, gBeam.elevation);
++}
++
++// How wide the column is now, 0 while it aims.
++static float destructBeamWidth()
++{
++    float t = gBeam.age - kBeamAim;
++    if (t < 0.0f) {
++        return 0.0f;
++    }
++    if (t < kBeamCharge) {
++        return 1.0f + t / kBeamCharge;
++    }
++    t -= kBeamCharge;
++    if (t < kBeamFire) {
++        float open = std::min(1.0f, t / 0.12f);
++        return 2.0f + open * (6.0f + 1.5f * sinf(gBeam.age * 47.0f) + destructRandom());
++    }
++    t -= kBeamFire;
++    return std::max(0.0f, 8.0f * (1.0f - t / kBeamFade));
++}
++
++static bool destructBeamRect(Rect* rect)
++{
++    int x;
++    int y;
++    if (!destructBeamDrawPoint(&x, &y)) {
++        return false;
++    }
++    rect->left = x - 44;
++    rect->right = x + 44;
++    rect->top = 0;
++    rect->bottom = y + 24;
++    return true;
++}
++
++static void destructBeamSound(const char* name)
++{
++    _gsound_play_sfx_file_volume(name, 0x7FFF);
++}
++
++void destructBeamAt(int tile, int elevation, int steerTile)
++{
++    if (!gDestructInitialized || !gDestructConfig.enabled || gBeam.active || !tileIsValid(tile)) {
++        return;
++    }
++
++    destructPrepareColors();
++    gBeam.active = true;
++    gBeam.steerTile = steerTile;
++    gBeam.elevation = elevation;
++    gBeam.anchor = tile;
++    gBeam.x = 0.0f;
++    gBeam.y = 0.0f;
++    gBeam.age = 0.0f;
++    gBeam.nextBlast = kBeamAim + kBeamCharge;
++    gBeam.sounds = 0;
++    gBeam.hasDrawn = false;
++    int x;
++    int y;
++    gBeam.lift = destructTileCenter(tile, elevation, &x, &y) ? destructRoofLift(x, y, elevation) : 0.0f;
++    gDestructLastTick = SDL_GetTicks();
++    destructBeamSound("wac1xxx1");
++}
++
++void destructGameUpdate()
++{
++    // The game's explosion enables the interface when it ends, so none while
++    // the game has it off: during an attack, another explosion or a scene.
++    bool uiFree = !gameUiIsDisabled();
++
++    if (gMeteorImpactTile != -1 && uiFree) {
++        int tile = gMeteorImpactTile;
++        gMeteorImpactTile = -1;
++        if (gMeteorImpactElevation == gElevation) {
++            // As the game's explosion, so that it throws people back.
++            gBlastMeteor = true;
++            if (actionExplode(tile, gMeteorImpactElevation, 40, 80, gDude, true) == -2) {
++                gMeteorImpactTile = tile;
++            }
++            gBlastMeteor = false;
++        }
++    }
++
++    if (gBeamBlasts.empty()) {
++        return;
++    }
++
++    std::vector<std::pair<int, int>> blasts;
++    blasts.swap(gBeamBlasts);
++    for (const auto& blast : blasts) {
++        if (blast.second == gElevation) {
++#ifdef WRECKED_TEST
++            int before = critterGetHitPoints(gDude);
++#endif
++            // The game plays one explosion at a time: the others while it
++            // goes only break things.
++            if (!uiFree || actionExplode(blast.first, blast.second, 20, 40, gDude, true) != 0) {
++                destructExplode(blast.first, blast.second, 2, 50, DESTRUCT_BLAST_FIRE);
++            }
++#ifdef WRECKED_TEST
++            fprintf(stderr, "destruct: beam blast at %d (player at %d, distance %d): player hp %d -> %d\n", blast.first, gDude->tile, tileDistanceBetween(blast.first, gDude->tile), before, critterGetHitPoints(gDude));
++#endif
++        }
++    }
++}
++
++static inline void destructBlend(unsigned char* dest, int r, int g, int b, int alpha)
++{
++    if (alpha <= 0) {
++        return;
++    }
++    if (alpha >= 255) {
++        *dest = destructColor(r, g, b);
++        return;
++    }
++    int under = Color2RGB(*dest);
++    int underR = ((under >> 10) & 0x1F) * 8;
++    int underG = ((under >> 5) & 0x1F) * 8;
++    int underB = (under & 0x1F) * 8;
++    *dest = destructColor(underR + (r - underR) * alpha / 255,
++        underG + (g - underG) * alpha / 255,
++        underB + (b - underB) * alpha / 255);
++}
++
++// Where the meteor is: ground pixels from the center of its tile, and its
++// height, `progress` from 0 (far up) to 1 (landed).
++static void destructMeteorPosition(float progress, float* x, float* y, float* z)
++{
++    *x = kMeteorFromX * (1.0f - progress);
++    *y = kMeteorFromY * (1.0f - progress);
++    *z = kMeteorHeight * (1.0f - progress);
++}
++
++static float destructMeteorProgress()
++{
++    // It speeds up as it falls.
++    float t = std::min(1.0f, gMeteor.age / kMeteorFall);
++    return t * (0.45f + 0.55f * t);
++}
++
++// Where the meteor is drawn hitting.
++static bool destructMeteorTarget(int* x, int* y)
++{
++    if (!destructTileCenter(gMeteor.tile, gMeteor.elevation, x, y)) {
++        return false;
++    }
++    *y -= (int)lroundf(gMeteor.lift);
++    return true;
++}
++
++static bool destructMeteorRect(Rect* rect)
++{
++    int targetX;
++    int targetY;
++    if (!destructMeteorTarget(&targetX, &targetY)) {
++        return false;
++    }
++    float x;
++    float y;
++    float z;
++    destructMeteorPosition(destructMeteorProgress(), &x, &y, &z);
++    int headX = targetX + (int)x;
++    int headY = targetY + (int)(y - z);
++    // The head, its tail back along the way it came, and the glow on the
++    // ground.
++    rect->left = std::min(headX - 24, targetX - 64);
++    rect->right = std::max(headX + 150, targetX + 64);
++    rect->top = std::max(0, headY - 150);
++    rect->bottom = std::max(headY + 24, targetY + 34);
++    return true;
++}
++
++static void destructMeteorLaunch(int tile, int elevation, float lift)
++{
++    if (!gDestructInitialized || !gDestructConfig.enabled || gMeteor.active || gMeteorImpactTile != -1 || !tileIsValid(tile)) {
++        return;
++    }
++
++    destructPrepareColors();
++    gMeteor.active = true;
++    gMeteor.elevation = elevation;
++    gMeteor.tile = tile;
++    gMeteor.lift = lift;
++    gMeteor.age = 0.0f;
++    gMeteor.hasDrawn = false;
++    gDestructLastTick = SDL_GetTicks();
++    destructBeamSound("wan1xxx1");
++}
++
++void destructMeteorAt(int tile, int elevation)
++{
++    int x;
++    int y;
++    if (destructTileCenter(tile, elevation, &x, &y)) {
++        destructMeteorLaunch(tile, elevation, destructRoofLift(x, y, elevation));
++    }
++}
++
++void destructMeteorAtCursor()
++{
++    if (!gDestructConfig.meteor) {
++        return;
++    }
++
++    int x;
++    int y;
++    float lift;
++    if (!destructCursorGround(&x, &y, gElevation, &lift)) {
++        return;
++    }
++
++    int tile = tileFromScreenXY(x, y, gElevation);
++    if (tile != -1) {
++        destructMeteorLaunch(tile, gElevation, lift);
++    }
++}
++
++// What the impact does besides the explosion: the roof over it caves in, a
++// ring of dust rushes out, rocks fly, and the meteor stays in its crater.
++static void destructMeteorImpact(Rect* dirty, bool* anyDirty)
++{
++    int tile = gMeteor.tile;
++    int elevation = gMeteor.elevation;
++    int centerX;
++    int centerY;
++    if (!destructTileCenter(tile, elevation, &centerX, &centerY)) {
++        return;
++    }
++
++    destructBeamSound("whn1xxx2");
++    destructBeamSound("whn1xxx1");
++
++    if (!destructMapBlocked()) {
++        destructBreakRoof(tile, elevation, centerX, centerY, 70.0f, 2.0f, dirty, anyDirty);
++    }
++
++    unsigned char dust = destructNearest(120, 108, 92);
++    unsigned char ground = destructFloorPixel(centerX, centerY, elevation);
++    if (ground != 0 && ground < kGlowStart) {
++        int r;
++        int g;
++        int b;
++        destructColorRgb(ground, &r, &g, &b);
++        dust = destructNearest(r + 30, g + 26, b + 20);
++    }
++
++    // The shock: a ring of dust thrown along the ground.
++    const DestructSprite* puff = destructSpriteVariant("puff");
++    for (int index = 0; puff != nullptr && index < 36; index++) {
++        float angle = index * 6.2831853f / 36.0f + destructBetween(-0.05f, 0.05f);
++        Particle smoke = destructNewParticle(PARTICLE_SMOKE, tile, elevation);
++        smoke.sprite = destructSpriteVariant("puff");
++        smoke.frame = destructPick(smoke.sprite->frames);
++        smoke.x = cosf(angle) * 12.0f;
++        smoke.y = sinf(angle) * 6.0f;
++        smoke.z = gMeteor.lift + destructBetween(2.0f, 8.0f);
++        float speed = destructBetween(240.0f, 320.0f);
++        smoke.vx = cosf(angle) * speed;
++        smoke.vy = sinf(angle) * speed * 0.5f;
++        smoke.vz = destructBetween(4.0f, 14.0f);
++        smoke.scale = destructBetween(0.5f, 0.7f);
++        smoke.growth = destructBetween(0.5f, 0.8f);
++        smoke.opacity = 0.6f;
++        smoke.color = dust;
++        smoke.life = destructBetween(1.6f, 2.4f);
++        destructAddParticle(std::move(smoke));
++    }
++
++    // Molten rock thrown high.
++    for (int index = 0; index < 26; index++) {
++        const DestructSprite* sprite = destructSpriteVariant("rock");
++        if (sprite == nullptr) {
++            break;
++        }
++        Particle chunk = destructNewParticle(PARTICLE_CHUNK, tile, elevation);
++        chunk.sprite = sprite;
++        chunk.color = index % 3 == 0 ? destructNearest(150, 70, 30) : destructNearest(52, 46, 44);
++        chunk.frame = destructPick(sprite->frames);
++        chunk.spin = destructBetween(8.0f, 20.0f);
++        chunk.x = destructBetween(-8.0f, 8.0f);
++        chunk.y = destructBetween(-4.0f, 4.0f);
++        chunk.z = gMeteor.lift;
++        destructLaunch(&chunk, 0.0f, 0.0f, destructBetween(80.0f, 300.0f), destructBetween(250.0f, 520.0f));
++        chunk.keep = true;
++        destructAddParticle(std::move(chunk));
++    }
++
++    // The meteor, in what is left of it.
++    std::string name;
++    const DestructSprite* sprite = destructSpriteVariant("pilel", &name);
++    if (sprite != nullptr && gDestructConfig.craters && !destructMapBlocked() && destructFloorPixel(centerX, centerY, elevation) != 0) {
++        Decal rock;
++        rock.kind = DECAL_PILE;
++        rock.elevation = elevation;
++        rock.tile = tile;
++        rock.x = 16 - sprite->anchorX;
++        rock.y = 8 - sprite->anchorY;
++        rock.sprite = name;
++        rock.frame = destructPick(sprite->frames);
++        int tones[8][3] = { { 22, 20, 20 }, { 34, 30, 28 }, { 46, 40, 36 }, { 60, 50, 44 }, { 110, 46, 20 }, { 72, 60, 52 }, { 40, 34, 32 }, { 150, 70, 24 } };
++        for (int index = 0; index < 8; index++) {
++            rock.colors[index] = destructNearest(tones[index][0], tones[index][1], tones[index][2]);
++        }
++        rock.width = 0;
++        rock.height = 0;
++        rock.resolved = nullptr;
++        destructAddDecal(std::move(rock));
++    }
++
++    if (gDestructConfig.flash) {
++        gFlashTile = tile;
++        gFlashElevation = elevation;
++        gFlashAge = 0.0f;
++        gFlashRadius = 160.0f;
++        gFlashDirty = true;
++    }
++    if (gDestructConfig.shake) {
++        gShakeStart = SDL_GetTicks();
++        gShakeAmplitude = 9.0f;
++    }
++
++    // The explosion itself, which hurts, from the game loop.
++    gMeteorImpactTile = tile;
++    gMeteorImpactElevation = elevation;
++}
++
++static void destructMeteorStep(float dt, Rect* dirty, bool* anyDirty)
++{
++    auto addDirty = [&](const Rect& rect) {
++        if (*anyDirty) {
++            rectUnion(dirty, &rect, dirty);
++        } else {
++            *dirty = rect;
++            *anyDirty = true;
++        }
++    };
++
++    if (gMeteor.hasDrawn && gMeteor.elevation == gElevation) {
++        addDirty(gMeteor.drawn);
++    }
++
++    float before = destructMeteorProgress();
++    gMeteor.age += dt;
++    if (gMeteor.elevation != gElevation) {
++        gMeteor.active = false;
++        gMeteor.hasDrawn = false;
++        return;
++    }
++
++    if (gMeteor.age >= kMeteorFall) {
++        destructMeteorImpact(dirty, anyDirty);
++        gMeteor.active = false;
++        gMeteor.hasDrawn = false;
++        return;
++    }
++
++    // A rumble that grows as it comes.
++    float progress = destructMeteorProgress();
++    if (gDestructConfig.shake) {
++        gShakeStart = SDL_GetTicks();
++        gShakeAmplitude = std::max(gShakeAmplitude, 0.4f + 2.6f * progress);
++    }
++
++    // Fire and smoke left along the way.
++    const DestructSprite* sprite = destructSpriteVariant("puff");
++    for (int index = 0; sprite != nullptr && index < 3; index++) {
++        float x;
++        float y;
++        float z;
++        destructMeteorPosition(before + (progress - before) * (index + 0.5f) / 3.0f, &x, &y, &z);
++        Particle fire = destructNewParticle(index == 0 ? PARTICLE_FIRE : PARTICLE_SMOKE, gMeteor.tile, gMeteor.elevation);
++        fire.sprite = destructSpriteVariant("puff");
++        fire.frame = destructPick(fire.sprite->frames);
++        fire.x = x + destructBetween(-2.0f, 2.0f);
++        fire.y = y + destructBetween(-1.0f, 1.0f);
++        fire.z = gMeteor.lift + z + destructBetween(-2.0f, 2.0f);
++        fire.vx = destructBetween(-6.0f, 6.0f);
++        fire.vy = destructBetween(-3.0f, 3.0f);
++        fire.vz = destructBetween(-4.0f, 10.0f);
++        if (fire.kind == PARTICLE_FIRE) {
++            fire.scale = destructBetween(0.25f, 0.4f);
++            fire.growth = destructBetween(0.4f, 0.7f);
++            fire.life = destructBetween(0.3f, 0.5f);
++            fire.color = destructNearest(64, 60, 56);
++        } else {
++            fire.scale = destructBetween(0.3f, 0.45f);
++            fire.growth = destructBetween(0.35f, 0.6f);
++            fire.opacity = 0.45f;
++            fire.color = destructNearest(76, 72, 68);
++            fire.life = destructBetween(1.8f, 3.0f);
++        }
++        destructAddParticle(std::move(fire));
++    }
++
++    Rect rect;
++    if (destructMeteorRect(&rect)) {
++        gMeteor.drawn = rect;
++        gMeteor.hasDrawn = true;
++        addDirty(rect);
++    }
++}
++
++// The meteor over everything: a burning head with a tail of fire, and the
++// ground lit orange under it as it nears.
++static void destructRenderMeteor(Rect* rect)
++{
++    Rect meteorRect;
++    Rect clipped;
++    if (!destructMeteorRect(&meteorRect) || !destructClip(&meteorRect, rect, &clipped)) {
++        return;
++    }
++
++    int targetX;
++    int targetY;
++    destructMeteorTarget(&targetX, &targetY);
++    float progress = destructMeteorProgress();
++    float x;
++    float y;
++    float z;
++    destructMeteorPosition(progress, &x, &y, &z);
++    float headX = targetX + x;
++    float headY = targetY + y - z;
++
++    // The ground glows under it.
++    float glow = 18.0f + 46.0f * progress;
++    for (int py = std::max(clipped.top, targetY - (int)(glow * 0.5f) - 1); py <= std::min(clipped.bottom, targetY + (int)(glow * 0.5f) + 1); py++) {
++        for (int px = std::max(clipped.left, targetX - (int)glow - 1); px <= std::min(clipped.right, targetX + (int)glow + 1); px++) {
++            float dx = (px - targetX) / glow;
++            float dy = (py - targetY) * 2.0f / glow;
++            float d = dx * dx + dy * dy;
++            if (d < 1.0f) {
++                destructBlend(gDestructBuffer + py * gDestructPitch + px, 255, 150, 60, (int)(150.0f * progress * (1.0f - d)));
++            }
++        }
++    }
++
++    // The tail: back along the way it came, thinning and cooling.
++    float pathX = kMeteorFromX;
++    float pathY = kMeteorFromY - kMeteorHeight;
++    float length = sqrtf(pathX * pathX + pathY * pathY);
++    float dirX = pathX / length;
++    float dirY = pathY / length;
++    float tail = 40.0f + 110.0f * progress;
++    float head = 4.0f + 6.0f * progress;
++    for (int py = clipped.top; py <= clipped.bottom; py++) {
++        for (int px = clipped.left; px <= clipped.right; px++) {
++            float rx = px + 0.5f - headX;
++            float ry = py + 0.5f - headY;
++            float along = rx * dirX + ry * dirY;
++            float across = fabsf(-rx * dirY + ry * dirX);
++            float d = sqrtf(rx * rx + ry * ry);
++            if (d < head) {
++                // White-hot core, yellow rim.
++                float k = d / head;
++                destructBlend(gDestructBuffer + py * gDestructPitch + px, 255, (int)(255 - 50 * k), (int)(230 - 170 * k), 255);
++                continue;
++            }
++            if (d < head * 2.6f) {
++                float k = (d - head) / (head * 1.6f);
++                destructBlend(gDestructBuffer + py * gDestructPitch + px, 255, 170, 70, (int)(170.0f * (1.0f - k)));
++                continue;
++            }
++            if (along <= 0.0f || along > tail) {
++                continue;
++            }
++            float t = along / tail;
++            float width = head * (1.0f - 0.85f * t) * (0.85f + 0.3f * sinf(along * 0.4f - gMeteor.age * 40.0f));
++            if (across > width) {
++                continue;
++            }
++            float edge = across / std::max(0.5f, width);
++            int r = 255;
++            int g = (int)(220 - 170 * t);
++            int b = (int)(120 - 100 * t);
++            int alpha = (int)(240.0f * (1.0f - t) * (1.0f - 0.6f * edge));
++            destructBlend(gDestructBuffer + py * gDestructPitch + px, r, std::max(g, 30), std::max(b, 10), alpha);
++        }
++    }
++}
++
++void destructBeamAtCursor()
++{
++    int x;
++    int y;
++    if (!destructCursorGround(&x, &y, gElevation)) {
++        return;
++    }
++
++    int tile = tileFromScreenXY(x, y, gElevation);
++    if (tile != -1) {
++        destructBeamAt(tile, gElevation, -1);
++    }
++}
++
++// Moves the beam on and sets off what it does; adds what to redraw.
++static void destructBeamStep(float dt, Rect* dirty, bool* anyDirty)
++{
++    auto addDirty = [&](const Rect& rect) {
++        if (*anyDirty) {
++            rectUnion(dirty, &rect, dirty);
++        } else {
++            *dirty = rect;
++            *anyDirty = true;
++        }
++    };
++
++    if (gBeam.hasDrawn && gBeam.elevation == gElevation) {
++        addDirty(gBeam.drawn);
++    }
++
++    gBeam.age += dt;
++    float fireStart = kBeamAim + kBeamCharge;
++    float fireEnd = fireStart + kBeamFire;
++    if (gBeam.age >= fireEnd + kBeamFade || gBeam.elevation != gElevation) {
++        gBeam.active = false;
++        gBeam.hasDrawn = false;
++        return;
++    }
++
++    int pointX;
++    int pointY;
++    if (!destructBeamPoint(&pointX, &pointY)) {
++        gBeam.active = false;
++        return;
++    }
++
++    // Onto a roof and off it quickly but not at once.
++    {
++        float lift = destructRoofLift(pointX, pointY, gBeam.elevation);
++        float step = 900.0f * dt;
++        gBeam.lift = gBeam.lift < lift ? std::min(lift, gBeam.lift + step) : std::max(lift, gBeam.lift - step);
++    }
++
++    bool firing = gBeam.age >= fireStart && gBeam.age < fireEnd;
++    if (firing) {
++        if (gBeam.sounds == 0 || (gBeam.sounds == 1 && gBeam.age >= fireStart + 0.9f)) {
++            destructBeamSound("wam1xxx1");
++            gBeam.sounds++;
++        }
++
++        // It follows the cursor, slowly, as if dragged across the ground.
++        int mouseX;
++        int mouseY;
++        bool steered = gBeam.steerTile != -1 && destructTileCenter(gBeam.steerTile, gBeam.elevation, &mouseX, &mouseY);
++        if (steered || destructCursorGround(&mouseX, &mouseY, gBeam.elevation)) {
++            {
++                float dx = (float)(mouseX - pointX);
++                float dy = (float)(mouseY - pointY) * 2.0f;
++                float length = sqrtf(dx * dx + dy * dy);
++                float step = kBeamSpeed * dt;
++                if (length > 1.0f) {
++                    float move = std::min(step, length) / length;
++                    gBeam.x += dx * move;
++                    gBeam.y += dy * move * 0.5f;
++                }
++            }
++        }
++
++        int tile = destructBeamTile();
++        if (tile != -1) {
++            // It lights everything around it.
++            gFlashTile = tile;
++            gFlashElevation = gBeam.elevation;
++            gFlashAge = 0.04f;
++            gFlashRadius = 70.0f;
++            gFlashDirty = true;
++
++            if (gDestructConfig.shake) {
++                gShakeStart = SDL_GetTicks();
++                gShakeAmplitude = std::max(gShakeAmplitude, 1.6f);
++            }
++
++            if (gBeam.age >= gBeam.nextBlast) {
++                gBeam.nextBlast += kBeamBlastEvery;
++                destructBeamSound("whn1xxx1");
++                // It burns through roofs on its way down.
++                if (!destructMapBlocked()) {
++                    destructBreakRoof(tile, gBeam.elevation, pointX, pointY, 34.0f, 1.2f, dirty, anyDirty);
++                }
++                gBeamBlasts.push_back({ tile, gBeam.elevation });
++            }
++
++            // Sparks thrown up where it touches the ground.
++            int centerX;
++            int centerY;
++            if (destructTileCenter(tile, gBeam.elevation, &centerX, &centerY)) {
++                int sparks = 2 + destructPick(3);
++                for (int index = 0; index < sparks; index++) {
++                    Particle spark = destructNewParticle(PARTICLE_SPARK, tile, gBeam.elevation);
++                    spark.variant = destructPick(5);
++                    spark.x = (float)(pointX - centerX) + destructBetween(-4.0f, 4.0f);
++                    spark.y = (float)(pointY - centerY) + destructBetween(-2.0f, 2.0f);
++                    spark.z = gBeam.lift + destructBetween(1.0f, 6.0f);
++                    float angle = destructBetween(0.0f, 6.2831853f);
++                    float speed = destructBetween(60.0f, 200.0f);
++                    spark.vx = cosf(angle) * speed;
++                    spark.vy = sinf(angle) * speed * 0.5f;
++                    spark.vz = destructBetween(120.0f, 320.0f);
++                    spark.life = destructBetween(0.3f, 0.8f);
++                    destructAddParticle(std::move(spark));
++                }
++            }
++        }
++    }
++
++    Rect rect;
++    if (destructBeamRect(&rect)) {
++        gBeam.drawn = rect;
++        gBeam.hasDrawn = true;
++        if (gBeam.elevation == gElevation) {
++            addDirty(rect);
++        }
++    }
++}
++
++
++// The beam and the meteor over everything, roofs too: they come from above.
++void destructRenderSky(Rect* rect, int elevation)
++{
++    if (!gDestructInitialized || gDestructBuffer == nullptr) {
++        return;
++    }
++
++    if (gMeteor.active && gMeteor.elevation == elevation) {
++        destructRenderMeteor(rect);
++    }
++
++    if (!gBeam.active || gBeam.elevation != elevation) {
++        return;
++    }
++
++    Rect beamRect;
++    Rect clipped;
++    if (!destructBeamRect(&beamRect) || !destructClip(&beamRect, rect, &clipped)) {
++        return;
++    }
++
++    int pointX;
++    int pointY;
++    destructBeamDrawPoint(&pointX, &pointY);
++    float t = gBeam.age;
++    auto plot = [&](int x, int y, int r, int g, int b, int alpha) {
++        if (x >= clipped.left && x <= clipped.right && y >= clipped.top && y <= clipped.bottom) {
++            destructBlend(gDestructBuffer + y * gDestructPitch + x, r, g, b, alpha);
++        }
++    };
++
++    if (t < kBeamAim) {
++        // The designator: a dotted red line from the sky and a ring on the
++        // ground that closes in.
++        bool shown = (destructHash((int)(t * 30.0f), 7) & 3) != 0;
++        if (shown) {
++            for (int y = clipped.top; y <= std::min(clipped.bottom, pointY); y++) {
++                if (((y + (int)(t * 240.0f)) % 7) < 4) {
++                    plot(pointX, y, 255, 40, 30, 190);
++                }
++            }
++        }
++        float pulse = 0.5f + 0.5f * sinf(t * 18.0f);
++        float radius = 22.0f - 10.0f * (t / kBeamAim) + 2.0f * pulse;
++        for (int ring = 0; ring < 2; ring++) {
++            float r = radius - ring;
++            for (int step = 0; step < 128; step++) {
++                float angle = step * 6.2831853f / 128.0f;
++                // Four arcs that turn.
++                if ((((int)(angle * 8.0f / 6.2831853f + t * 6.0f)) & 1) != 0) {
++                    continue;
++                }
++                int x = pointX + (int)lroundf(cosf(angle) * r);
++                int y = pointY + (int)lroundf(sinf(angle) * r * 0.5f);
++                plot(x, y, 255, 40 + 60 * ring, 30 + 40 * ring, 240);
++            }
++        }
++        for (int d = -3; d <= 3; d++) {
++            plot(pointX + d, pointY, 255, 80, 60, d == 0 ? 255 : 200);
++            plot(pointX, pointY + d / 2, 255, 80, 60, 200);
++        }
++        return;
++    }
++
++    float width = destructBeamWidth();
++    if (width <= 0.0f) {
++        return;
++    }
++    float fading = t > kBeamAim + kBeamCharge + kBeamFire ? 1.0f - (t - kBeamAim - kBeamCharge - kBeamFire) / kBeamFade : 1.0f;
++    bool full = t >= kBeamAim + kBeamCharge;
++
++    // Glow on the ground around where it hits.
++    if (full) {
++        float glowX = 30.0f + 4.0f * sinf(t * 31.0f);
++        for (int y = std::max(clipped.top, pointY - 20); y <= std::min(clipped.bottom, pointY + 20); y++) {
++            for (int x = std::max(clipped.left, pointX - (int)glowX - 1); x <= std::min(clipped.right, pointX + (int)glowX + 1); x++) {
++                float dx = (x - pointX) / glowX;
++                float dy = (y - pointY) * 2.0f / glowX;
++                float d = dx * dx + dy * dy;
++                if (d >= 1.0f) {
++                    continue;
++                }
++                int alpha = (int)(fading * 200.0f * (1.0f - d) * (1.0f - d));
++                if (d < 0.08f) {
++                    destructBlend(gDestructBuffer + y * gDestructPitch + x, 255, 255, 235, (int)(fading * 255));
++                } else {
++                    destructBlend(gDestructBuffer + y * gDestructPitch + x, 255, 214, 130, alpha);
++                }
++            }
++        }
++    }
++
++    // The column: a white-hot core in a gold sheath that ripples.
++    for (int y = clipped.top; y <= std::min(clipped.bottom, pointY); y++) {
++        float ripple = sinf(y * 0.11f + t * 26.0f) * 0.8f + sinf(y * 0.031f - t * 9.0f) * 0.6f;
++        float half = width * (0.85f + 0.15f * sinf(y * 0.07f + t * 37.0f));
++        // A little wider where it meets the ground.
++        half += std::max(0.0f, 6.0f - (pointY - y) * 0.25f) * (full ? 1.0f : 0.3f);
++        float center = pointX + ripple * (full ? 1.0f : 0.4f);
++        int left = (int)floorf(center - half - 3.0f);
++        int right = (int)ceilf(center + half + 3.0f);
++        for (int x = std::max(left, clipped.left); x <= std::min(right, clipped.right); x++) {
++            float d = fabsf(x + 0.5f - center) / std::max(0.5f, half);
++            int alpha;
++            int r;
++            int g;
++            int b;
++            if (d < 0.35f) {
++                r = 255;
++                g = 255;
++                b = 240;
++                alpha = 255;
++            } else if (d < 1.0f) {
++                float k = (d - 0.35f) / 0.65f;
++                r = 255;
++                g = (int)(245 - 60 * k);
++                b = (int)(200 - 130 * k);
++                alpha = (int)(255 - 120 * k);
++            } else {
++                float k = std::min(1.0f, (d - 1.0f) / (3.0f / std::max(0.5f, half)));
++                r = 255;
++                g = 170;
++                b = 60;
++                alpha = (int)(110 * (1.0f - k));
++            }
++            if (!full && (destructHash(y, (int)(t * 40.0f)) & 1) != 0) {
++                alpha /= 2;
++            }
++            destructBlend(gDestructBuffer + y * gDestructPitch + x, r, g, b, (int)(alpha * fading));
++        }
++    }
++}
++
++void destructExplodeAtCursor()
++{
++    if (!gDestructInitialized || !gDestructConfig.enabled || !gDestructConfig.testKey) {
++        return;
++    }
++
++    if (gDestructConfig.beam) {
++        destructBeamAtCursor();
++        return;
++    }
++
++    int x;
++    int y;
++    if (!destructCursorGround(&x, &y, gElevation)) {
++        return;
++    }
++
++    int tile = tileFromScreenXY(x, y, gElevation);
++    if (tile != -1) {
++        actionExplode(tile, gElevation, 30, 60, nullptr, true);
++    }
++}
++
++static void destructSettle(Particle* particle)
++{
++    particle->dead = true;
++    if (!particle->keep || (particle->kind != PARTICLE_PIECE && particle->kind != PARTICLE_CHUNK) || particle->tile == -1) {
++        return;
++    }
++
++    Rect rect;
++    int tileX;
++    int tileY;
++    if (!destructParticleRect(*particle, &rect) || tileToScreenXY(particle->tile, &tileX, &tileY, particle->elevation) != 0) {
++        return;
++    }
++
++    Decal debris;
++    debris.kind = DECAL_PIXELS;
++    debris.elevation = particle->elevation;
++    debris.tile = particle->tile;
++    debris.x = rect.left - tileX;
++    debris.y = rect.top - tileY;
++    debris.frame = 0;
++    memset(debris.colors, 0, sizeof(debris.colors));
++    debris.width = rect.right - rect.left + 1;
++    debris.height = rect.bottom - rect.top + 1;
++    debris.resolved = nullptr;
++    if (particle->kind == PARTICLE_PIECE) {
++        // Lying down it shows half its height, in the shade of the ground.
++        int width;
++        int height;
++        destructPieceSize(*particle, &width, &height);
++        int flat = std::max(1, (height + 1) / 2);
++        debris.y += height - flat;
++        debris.width = width;
++        debris.height = flat;
++        debris.pixels.assign((size_t)width * flat, 0);
++        for (int y = 0; y < flat; y++) {
++            for (int x = 0; x < width; x++) {
++                unsigned char color = destructPiecePixel(*particle, x, std::min(height - 1, y * 2 + 1));
++                if (color == 0) {
++                    color = destructPiecePixel(*particle, x, y * 2);
++                }
++                if (color != 0 && color < kGlowStart) {
++                    // Glass on the ground still catches the light here and
++                    // there.
++                    int level = particle->material == DESTRUCT_GLASS && (destructHash(x + particle->variant, y) & 3) == 0 ? 190 : 108;
++                    color = intensityColorTable[color][level];
++                    if (color == 0) {
++                        color = gDestructDark;
++                    }
++                }
++                debris.pixels[(size_t)y * width + x] = color;
++            }
++        }
++    } else {
++        const DestructSprite* sprite = particle->sprite;
++        int frame = particle->frame % sprite->frames;
++        debris.pixels.assign(debris.width * debris.height, 0);
++        for (int y = 0; y < sprite->height; y++) {
++            for (int x = 0; x < sprite->width; x++) {
++                const unsigned char* pixel = sprite->pixel(frame, x, y);
++                if (pixel[sprite->channels - 1] >= 128) {
++                    unsigned char color = intensityColorTable[particle->color][pixel[0]];
++                    debris.pixels[y * debris.width + x] = color != 0 ? color : 1;
++                }
++            }
++        }
++    }
++    destructAddDecal(std::move(debris));
++}
++
++static void destructStep(Particle* particle, float dt)
++{
++    if (particle->delay > 0.0f) {
++        particle->delay -= dt;
++        return;
++    }
++
++    particle->age += dt;
++
++    switch (particle->kind) {
++    case PARTICLE_PIECE:
++    case PARTICLE_CHUNK: {
++        float oldX = particle->x;
++        float oldY = particle->y;
++        if (particle->material == DESTRUCT_CLOTH) {
++            // Rags flutter down slowly, swaying.
++            float drag = std::max(0.0f, 1.0f - 2.2f * dt);
++            particle->vx *= drag;
++            particle->vy *= drag;
++            particle->vz = std::max(particle->vz - kGravity * 0.35f * dt, -55.0f);
++            particle->x += sinf(particle->age * 6.0f + particle->variant) * 22.0f * dt;
++        } else {
++            particle->vz -= kGravity * dt;
++        }
++        particle->x += particle->vx * dt;
++        particle->y += particle->vy * dt;
++        particle->z += particle->vz * dt;
++        if (particle->kind == PARTICLE_CHUNK && particle->spin > 0.0f) {
++            particle->frame = particle->sprite->frames > 0 ? (int)(particle->age * particle->spin) % particle->sprite->frames : 0;
++        }
++        if (particle->kind == PARTICLE_PIECE && particle->spin > 0.0f && particle->z > 0.0f) {
++            particle->frame = (int)(particle->age * particle->spin) % 4;
++        }
++
++        if (particle->z <= 0.0f) {
++            particle->z = 0.0f;
++            // Metal rings and bounces, glass skitters, cloth just lands.
++            float bounce = particle->material == DESTRUCT_METAL ? 0.45f : (particle->material == DESTRUCT_GLASS ? 0.2f : 0.3f);
++            float keepSpeed = particle->material == DESTRUCT_GLASS ? 0.75f : 0.55f;
++            if (particle->vz < (particle->material == DESTRUCT_METAL ? -45.0f : -70.0f) && particle->material != DESTRUCT_CLOTH) {
++                particle->vz = -particle->vz * bounce;
++                particle->vx *= keepSpeed;
++                particle->vy *= keepSpeed;
++            } else {
++                particle->vz = 0.0f;
++                float friction = std::max(0.0f, 1.0f - 9.0f * dt);
++                particle->vx *= friction;
++                particle->vy *= friction;
++                particle->spin *= friction;
++                if (fabsf(particle->vx) + fabsf(particle->vy) < 6.0f) {
++                    destructSettle(particle);
++                    return;
++                }
++            }
++        }
++
++        int tile = destructParticleTile(*particle);
++        if (tile == -1) {
++            particle->dead = true;
++            return;
++        }
++
++        if (tile != particle->tile) {
++            Object* blocker = _obj_blocking_at(nullptr, tile, particle->elevation);
++            if (blocker != nullptr && particle->z < 48.0f) {
++                // Bounces off what stands there.
++                particle->x = oldX;
++                particle->y = oldY;
++                particle->vx *= -0.35f;
++                particle->vy *= -0.35f;
++            } else {
++                particle->tile = tile;
++            }
++        }
++
++        if (particle->age > 7.0f) {
++            particle->z = 0.0f;
++            destructSettle(particle);
++        }
++        break;
++    }
++    case PARTICLE_SPARK:
++        particle->vz -= kGravity * 0.8f * dt;
++        particle->x += particle->vx * dt;
++        particle->y += particle->vy * dt;
++        particle->z += particle->vz * dt;
++        if (particle->z <= 0.0f || particle->age >= particle->life) {
++            particle->dead = true;
++            return;
++        }
++        particle->tile = destructParticleTile(*particle);
++        if (particle->tile == -1) {
++            particle->dead = true;
++        }
++        break;
++    case PARTICLE_FIRE: {
++        float drag = std::max(0.0f, 1.0f - 2.6f * dt);
++        particle->vx *= drag;
++        particle->vy *= drag;
++        particle->vz = particle->vz * std::max(0.0f, 1.0f - 2.0f * dt) + 24.0f * dt;
++        particle->x += particle->vx * dt;
++        particle->y += particle->vy * dt;
++        particle->z += particle->vz * dt;
++        particle->scale += particle->growth * dt;
++        if (particle->age >= particle->life) {
++            // Burnt out into smoke.
++            particle->kind = PARTICLE_SMOKE;
++            particle->age = 0.0f;
++            particle->life = destructBetween(1.8f, 3.2f);
++            particle->opacity = 0.5f;
++            particle->vz = destructBetween(16.0f, 32.0f);
++            particle->growth = destructBetween(0.15f, 0.35f);
++        }
++        particle->tile = destructParticleTile(*particle);
++        if (particle->tile == -1) {
++            particle->dead = true;
++        }
++        break;
++    }
++    case PARTICLE_SMOKE: {
++        float drag = std::max(0.0f, 1.0f - 1.6f * dt);
++        particle->vx *= drag;
++        particle->vy *= drag;
++        particle->x += particle->vx * dt;
++        particle->y += particle->vy * dt;
++        particle->z += particle->vz * dt;
++        particle->scale += particle->growth * dt;
++        if (particle->age >= particle->life) {
++            particle->dead = true;
++            return;
++        }
++        particle->tile = destructParticleTile(*particle);
++        if (particle->tile == -1) {
++            particle->dead = true;
++        }
++        break;
++    }
++    }
++}
++
++static void destructTick()
++{
++    if (!gDestructInitialized) {
++        return;
++    }
++
++    unsigned int now = SDL_GetTicks();
++    float dt = std::min(0.1f, (now - gDestructLastTick) / 1000.0f);
++    gDestructLastTick = now;
++    // Paused with the map, as the game's own animations are: under the
++    // inventory, the Pip-Boy, dialog and the world map.
++    if (isoIsDisabled()) {
++        return;
++    }
++    if (gParticles.empty() && !gFlashDirty && !gBeam.active && !gMeteor.active) {
++        return;
++    }
++    if (dt <= 0.0f) {
++        return;
++    }
++
++    Rect dirty;
++    bool anyDirty = false;
++    auto addDirty = [&](const Rect& rect) {
++        if (anyDirty) {
++            rectUnion(&dirty, &rect, &dirty);
++        } else {
++            dirty = rect;
++            anyDirty = true;
++        }
++    };
++
++    for (Particle& particle : gParticles) {
++        if (particle.hasDrawn && particle.elevation == gElevation) {
++            addDirty(particle.drawn);
++        }
++
++        destructStep(&particle, dt);
++
++        Rect rect;
++        if (!particle.dead && particle.delay <= 0.0f && destructParticleRect(particle, &rect)) {
++            particle.drawn = rect;
++            particle.hasDrawn = true;
++            if (particle.elevation == gElevation) {
++                addDirty(rect);
++            }
++        }
++    }
++
++    gParticles.erase(std::remove_if(gParticles.begin(), gParticles.end(), [](const Particle& particle) {
++        return particle.dead;
++    }),
++        gParticles.end());
++
++    if (gBeam.active) {
++        destructBeamStep(dt, &dirty, &anyDirty);
++    }
++    if (gMeteor.active) {
++        destructMeteorStep(dt, &dirty, &anyDirty);
++    }
++
++    if (gFlashDirty) {
++        Rect rect;
++        if (gFlashElevation == gElevation && destructFlashRect(&rect)) {
++            addDirty(rect);
++        }
++        gFlashAge += dt;
++        if (gFlashAge >= kFlashTime) {
++            gFlashDirty = false;
++        }
++    }
++
++    if (anyDirty) {
++        tileWindowRefreshRect(&dirty, gElevation);
++    }
++}
++
++static void destructClearEffects()
++{
++    gParticles.clear();
++    gParticleOrder.clear();
++    gFlashTile = -1;
++    gFlashDirty = false;
++    gShakeAmplitude = 0.0f;
++    gBeam.active = false;
++    gBeam.hasDrawn = false;
++    gBeamBlasts.clear();
++    gMeteor.active = false;
++    gMeteor.hasDrawn = false;
++    gMeteorImpactTile = -1;
++}
++
++void destructInit()
++{
++    if (gDestructInitialized) {
++        return;
++    }
++
++    destructLoadConfig();
++    // Switched off, the mod draws, loads and saves nothing either.
++    if (!gDestructConfig.enabled) {
++        return;
++    }
++    destructLoadSprites();
++
++    gDestructBuffer = windowGetBuffer(gIsoWindow);
++    gDestructWidth = windowGetWidth(gIsoWindow);
++    gDestructHeight = windowGetHeight(gIsoWindow);
++    gDestructPitch = gDestructWidth;
++    gDestructSeed ^= SDL_GetTicks() * 2654435761u;
++    if (gDestructSeed == 0) {
++        gDestructSeed = 0x9E3779B9;
++    }
++    gDestructLastTick = SDL_GetTicks();
++    gDestructInitialized = gDestructBuffer != nullptr;
++    if (gDestructInitialized) {
++        tickersAdd(destructTick);
++    }
++}
++
++void destructExit()
++{
++    if (!gDestructInitialized) {
++        return;
++    }
++
++    tickersRemove(destructTick);
++    destructClearEffects();
++    gDestructDecals.clear();
++    gDestructSprites.clear();
++    gDestructInitialized = false;
++}
++
++void destructReset()
++{
++    destructClearEffects();
++    gDestructDecals.clear();
++    gDestructDamage.clear();
++    gDestructRoofs.clear();
++    gDamageIndexDirty = true;
++}
++
++void destructMapEnter()
++{
++    destructClearEffects();
++    gDestructMap = destructMapKey(gMapHeader.name);
++    gDamageIndexDirty = true;
++}
++
++void destructMapForget(const char* mapName)
++{
++    // Or debris still flying would bring the map's entries back.
++    if (destructMapKey(mapName) == gDestructMap) {
++        destructClearEffects();
++    }
++    gDestructDecals.erase(destructMapKey(mapName));
++    gDestructDamage.erase(destructMapKey(mapName));
++    gDestructRoofs.erase(destructMapKey(mapName));
++    gDamageIndexDirty = true;
++}
++
++// The CRC of the slot's SAVE.DAT. DESTRUCT.DAT keeps it, so that one left
++// behind when the game was saved over without the mod is not loaded into the
++// new save.
++static uint32_t destructSaveChecksum(const char* directory)
++{
++    char path[COMPAT_MAX_PATH];
++    snprintf(path, sizeof(path), "%sSAVE.DAT", directory);
++
++    File* stream = fileOpen(path, "rb");
++    if (stream == nullptr) {
++        return 0;
++    }
++
++    uLong crc = crc32(0L, Z_NULL, 0);
++    unsigned char buffer[16384];
++    size_t read;
++    while ((read = fileRead(buffer, 1, sizeof(buffer), stream)) > 0) {
++        crc = crc32(crc, buffer, (uInt)read);
++    }
++    fileClose(stream);
++    return (uint32_t)crc;
++}
++
++void destructSave(const char* directory)
++{
++    if (!gDestructInitialized) {
++        return;
++    }
++
++    uint32_t checksum = destructSaveChecksum(directory);
++
++    char path[COMPAT_MAX_PATH];
++    snprintf(path, sizeof(path), "%sDESTRUCT.DAT", directory);
++
++    File* stream = fileOpen(path, "wb");
++    if (stream == nullptr) {
++        return;
++    }
++
++    uint32_t mapCount = 0;
++    for (const auto& entry : gDestructDecals) {
++        if (!entry.second.empty()) {
++            mapCount++;
++        }
++    }
++
++    fileWrite("DSV4", 1, 4, stream);
++    fileWrite(&checksum, 4, 1, stream);
++    fileWrite(&mapCount, 4, 1, stream);
++    for (const auto& entry : gDestructDecals) {
++        if (entry.second.empty()) {
++            continue;
++        }
++
++        uint16_t nameLength = (uint16_t)entry.first.size();
++        uint32_t count = (uint32_t)entry.second.size();
++        fileWrite(&nameLength, 2, 1, stream);
++        fileWrite(entry.first.data(), 1, nameLength, stream);
++        fileWrite(&count, 4, 1, stream);
++        for (const Decal& decal : entry.second) {
++            int32_t numbers[4] = { decal.elevation, decal.tile, decal.x, decal.y };
++            fileWrite(&(decal.kind), 1, 1, stream);
++            fileWrite(numbers, 4, 4, stream);
++            if (decal.kind == DECAL_PIXELS) {
++                uint16_t size[2] = { (uint16_t)decal.width, (uint16_t)decal.height };
++                fileWrite(size, 2, 2, stream);
++                fileWrite(decal.pixels.data(), 1, decal.pixels.size(), stream);
++            } else {
++                unsigned char length = (unsigned char)std::min<size_t>(decal.sprite.size(), 15);
++                uint16_t frame = (uint16_t)decal.frame;
++                fileWrite(&length, 1, 1, stream);
++                fileWrite(decal.sprite.data(), 1, length, stream);
++                fileWrite(&frame, 2, 1, stream);
++                fileWrite(decal.colors, 1, 8, stream);
++            }
++        }
++    }
++
++    uint32_t damageMapCount = 0;
++    for (const auto& entry : gDestructDamage) {
++        if (!entry.second.empty()) {
++            damageMapCount++;
++        }
++    }
++    fileWrite(&damageMapCount, 4, 1, stream);
++    for (const auto& entry : gDestructDamage) {
++        if (entry.second.empty()) {
++            continue;
++        }
++
++        uint16_t nameLength = (uint16_t)entry.first.size();
++        uint32_t count = (uint32_t)entry.second.size();
++        fileWrite(&nameLength, 2, 1, stream);
++        fileWrite(entry.first.data(), 1, nameLength, stream);
++        fileWrite(&count, 4, 1, stream);
++        for (const Damage& damage : entry.second) {
++            int32_t numbers[5] = { damage.elevation, damage.tile, damage.fid, damage.width, damage.height };
++            std::vector<unsigned char> packed(compressBound(damage.mask.size()));
++            uLongf packedSize = packed.size();
++            compress(packed.data(), &packedSize, damage.mask.data(), damage.mask.size());
++            uint32_t size = (uint32_t)packedSize;
++            fileWrite(numbers, 4, 5, stream);
++            fileWrite(&size, 4, 1, stream);
++            fileWrite(packed.data(), 1, size, stream);
++        }
++    }
++
++    uint32_t roofMapCount = 0;
++    for (const auto& entry : gDestructRoofs) {
++        if (!entry.second.empty()) {
++            roofMapCount++;
++        }
++    }
++    fileWrite(&roofMapCount, 4, 1, stream);
++    for (const auto& entry : gDestructRoofs) {
++        if (entry.second.empty()) {
++            continue;
++        }
++
++        uint16_t nameLength = (uint16_t)entry.first.size();
++        uint32_t count = (uint32_t)entry.second.size();
++        fileWrite(&nameLength, 2, 1, stream);
++        fileWrite(entry.first.data(), 1, nameLength, stream);
++        fileWrite(&count, 4, 1, stream);
++        for (const auto& roof : entry.second) {
++            const RoofDamage& damage = roof.second;
++            int32_t numbers[4] = { roof.first, damage.fid, damage.width, damage.height };
++            std::vector<unsigned char> packed(compressBound(damage.mask.size()));
++            uLongf packedSize = packed.size();
++            compress(packed.data(), &packedSize, damage.mask.data(), damage.mask.size());
++            uint32_t size = (uint32_t)packedSize;
++            fileWrite(numbers, 4, 4, stream);
++            fileWrite(&size, 4, 1, stream);
++            fileWrite(packed.data(), 1, size, stream);
++        }
++    }
++
++    fileClose(stream);
++}
++
++void destructLoad(const char* directory)
++{
++    destructClearEffects();
++    gDestructDecals.clear();
++    gDestructDamage.clear();
++    gDestructRoofs.clear();
++    gDamageIndexDirty = true;
++
++    if (!gDestructInitialized) {
++        return;
++    }
++
++    // Soot that loaded walls show needs the colors.
++    destructPrepareColors();
++
++    char path[COMPAT_MAX_PATH];
++    snprintf(path, sizeof(path), "%sDESTRUCT.DAT", directory);
++
++    File* stream = fileOpen(path, "rb");
++    if (stream == nullptr) {
++        return;
++    }
++
++    // DSV3 has no checksum.
++    char magic[4];
++    uint32_t checksum = 0;
++    uint32_t mapCount;
++    bool ok = fileRead(magic, 1, 4, stream) == 4 && memcmp(magic, "DSV", 3) == 0 && (magic[3] == '3' || magic[3] == '4');
++    if (ok && magic[3] == '4') {
++        ok = fileRead(&checksum, 4, 1, stream) == 1 && checksum == destructSaveChecksum(directory);
++    }
++    ok = ok && fileRead(&mapCount, 4, 1, stream) == 1;
++    for (uint32_t map = 0; ok && map < mapCount; map++) {
++        uint16_t nameLength;
++        uint32_t count;
++        char name[256];
++        ok = fileRead(&nameLength, 2, 1, stream) == 1 && nameLength < sizeof(name) && fileRead(name, 1, nameLength, stream) == nameLength && fileRead(&count, 4, 1, stream) == 1;
++        if (!ok) {
++            break;
++        }
++        name[nameLength] = '\0';
++
++        std::vector<Decal>& decals = gDestructDecals[name];
++        for (uint32_t index = 0; ok && index < count; index++) {
++            Decal decal;
++            int32_t numbers[4];
++            ok = fileRead(&(decal.kind), 1, 1, stream) == 1 && decal.kind <= DECAL_PIXELS && fileRead(numbers, 4, 4, stream) == 4;
++            if (!ok) {
++                break;
++            }
++            decal.elevation = numbers[0];
++            decal.tile = numbers[1];
++            decal.x = numbers[2];
++            decal.y = numbers[3];
++            decal.frame = 0;
++            decal.resolved = nullptr;
++            memset(decal.colors, 0, sizeof(decal.colors));
++            if (decal.kind == DECAL_PIXELS) {
++                uint16_t size[2];
++                ok = fileRead(size, 2, 2, stream) == 2 && size[0] <= 1024 && size[1] <= 1024;
++                if (!ok) {
++                    break;
++                }
++                decal.width = size[0];
++                decal.height = size[1];
++                decal.pixels.resize((size_t)decal.width * decal.height);
++                ok = fileRead(decal.pixels.data(), 1, decal.pixels.size(), stream) == decal.pixels.size();
++            } else {
++                unsigned char length;
++                char sprite[16];
++                uint16_t frame;
++                ok = fileRead(&length, 1, 1, stream) == 1 && length < sizeof(sprite) && fileRead(sprite, 1, length, stream) == length
++                    && fileRead(&frame, 2, 1, stream) == 1 && fileRead(decal.colors, 1, 8, stream) == 8;
++                if (!ok) {
++                    break;
++                }
++                sprite[length] = '\0';
++                decal.sprite = sprite;
++                decal.frame = frame;
++                decal.resolved = destructSprite(decal.sprite);
++                if (decal.resolved == nullptr) {
++                    continue;
++                }
++                decal.width = decal.resolved->width;
++                decal.height = decal.resolved->height;
++            }
++
++            if (ok && elevationIsValid(decal.elevation) && tileIsValid(decal.tile)) {
++                decals.push_back(std::move(decal));
++            }
++        }
++    }
++
++    uint32_t damageMapCount = 0;
++    if (ok && fileRead(&damageMapCount, 4, 1, stream) != 1) {
++        damageMapCount = 0;
++    }
++    for (uint32_t map = 0; ok && map < damageMapCount; map++) {
++        uint16_t nameLength;
++        uint32_t count;
++        char name[256];
++        ok = fileRead(&nameLength, 2, 1, stream) == 1 && nameLength < sizeof(name) && fileRead(name, 1, nameLength, stream) == nameLength && fileRead(&count, 4, 1, stream) == 1;
++        if (!ok) {
++            break;
++        }
++        name[nameLength] = '\0';
++
++        std::vector<Damage>& list = gDestructDamage[name];
++        for (uint32_t index = 0; ok && index < count; index++) {
++            int32_t numbers[5];
++            uint32_t size;
++            ok = fileRead(numbers, 4, 5, stream) == 5 && fileRead(&size, 4, 1, stream) == 1 && size < (1u << 24);
++            if (!ok || numbers[3] <= 0 || numbers[4] <= 0 || numbers[3] > 4096 || numbers[4] > 4096 || numbers[3] * numbers[4] > 1024 * 1024) {
++                ok = false;
++                break;
++            }
++            std::vector<unsigned char> packed(size);
++            ok = fileRead(packed.data(), 1, size, stream) == size;
++            if (!ok) {
++                break;
++            }
++            Damage damage;
++            damage.elevation = numbers[0];
++            damage.tile = numbers[1];
++            damage.fid = numbers[2];
++            damage.width = numbers[3];
++            damage.height = numbers[4];
++            damage.mask.resize((size_t)damage.width * damage.height);
++            uLongf length = damage.mask.size();
++            damage.frame = -1;
++            damage.rotation = -1;
++            if (uncompress(damage.mask.data(), &length, packed.data(), size) == Z_OK && length == damage.mask.size()) {
++                list.push_back(std::move(damage));
++            }
++        }
++    }
++
++    uint32_t roofMapCount = 0;
++    if (ok && fileRead(&roofMapCount, 4, 1, stream) != 1) {
++        roofMapCount = 0;
++    }
++    for (uint32_t map = 0; ok && map < roofMapCount; map++) {
++        uint16_t nameLength;
++        uint32_t count;
++        char name[256];
++        ok = fileRead(&nameLength, 2, 1, stream) == 1 && nameLength < sizeof(name) && fileRead(name, 1, nameLength, stream) == nameLength && fileRead(&count, 4, 1, stream) == 1;
++        if (!ok) {
++            break;
++        }
++        name[nameLength] = '\0';
++
++        std::unordered_map<int, RoofDamage>& roofs = gDestructRoofs[name];
++        for (uint32_t index = 0; ok && index < count; index++) {
++            int32_t numbers[4];
++            uint32_t size;
++            ok = fileRead(numbers, 4, 4, stream) == 4 && fileRead(&size, 4, 1, stream) == 1 && size < (1u << 20);
++            if (!ok || numbers[0] < 0 || numbers[0] >= ELEVATION_COUNT * SQUARE_GRID_SIZE || numbers[2] <= 0 || numbers[3] <= 0 || numbers[2] > 256 || numbers[3] > 256 || numbers[2] * numbers[3] > 256 * 256) {
++                ok = false;
++                break;
++            }
++            std::vector<unsigned char> packed(size);
++            ok = fileRead(packed.data(), 1, size, stream) == size;
++            if (!ok) {
++                break;
++            }
++            RoofDamage damage;
++            damage.fid = numbers[1];
++            damage.width = numbers[2];
++            damage.height = numbers[3];
++            damage.mask.resize((size_t)damage.width * damage.height);
++            uLongf length = damage.mask.size();
++            if (uncompress(damage.mask.data(), &length, packed.data(), size) == Z_OK && length == damage.mask.size()) {
++                roofs[numbers[0]] = std::move(damage);
++            }
++        }
++    }
++
++    fileClose(stream);
++}
++
++#ifdef WRECKED_TEST
++bool destructTestSnapshot(const char* path)
++{
++    if (gDestructBuffer == nullptr) {
++        return false;
++    }
++
++    FILE* stream = fopen(path, "wb");
++    if (stream == nullptr) {
++        return false;
++    }
++
++    int rowSize = (gDestructWidth * 3 + 3) & ~3;
++    uint32_t fileSize = 54 + rowSize * gDestructHeight;
++    unsigned char header[54] = { 'B', 'M' };
++    memcpy(header + 2, &fileSize, 4);
++    uint32_t offset = 54;
++    uint32_t infoSize = 40;
++    int32_t width = gDestructWidth;
++    int32_t height = gDestructHeight;
++    uint16_t planes = 1;
++    uint16_t bits = 24;
++    memcpy(header + 10, &offset, 4);
++    memcpy(header + 14, &infoSize, 4);
++    memcpy(header + 18, &width, 4);
++    memcpy(header + 22, &height, 4);
++    memcpy(header + 26, &planes, 2);
++    memcpy(header + 28, &bits, 2);
++    fwrite(header, 1, 54, stream);
++
++    // The palette as shown, with its animated entries.
++    unsigned char* palette = _getSystemPalette();
++    std::vector<unsigned char> row(rowSize, 0);
++    for (int y = gDestructHeight - 1; y >= 0; y--) {
++        for (int x = 0; x < gDestructWidth; x++) {
++            unsigned char color = gDestructBuffer[y * gDestructPitch + x];
++            row[x * 3] = (unsigned char)(palette[color * 3 + 2] * 4);
++            row[x * 3 + 1] = (unsigned char)(palette[color * 3 + 1] * 4);
++            row[x * 3 + 2] = (unsigned char)(palette[color * 3] * 4);
++        }
++        fwrite(row.data(), 1, rowSize, stream);
++    }
++    fclose(stream);
++    return true;
++}
++
++// Each damage mask of the map as a PGM: black gone, grey levels as drawn.
++void destructTestDumpDamage(const char* directory)
++{
++    std::vector<Damage>* list = destructCurrentDamage();
++    if (list == nullptr) {
++        return;
++    }
++    for (const Damage& damage : *list) {
++        char path[512];
++        snprintf(path, sizeof(path), "%s/damage_%08x_%d.pgm", directory, damage.fid, damage.tile);
++        FILE* stream = fopen(path, "wb");
++        if (stream == nullptr) {
++            continue;
++        }
++        fprintf(stream, "P5 %d %d 255\n", damage.width, damage.height);
++        for (unsigned char mark : damage.mask) {
++            unsigned char value = mark == kGone ? 0 : (mark == 0 ? 128 : mark / 2 + 1);
++            fputc(value, stream);
++        }
++        fclose(stream);
++    }
++}
++
++int destructTestDecalCount()
++{
++    auto it = gDestructDecals.find(gDestructMap);
++    return it != gDestructDecals.end() ? (int)it->second.size() : 0;
++}
++#endif
++
++} // namespace fallout
+diff --git a/src/destruct.h b/src/destruct.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a79b84ecc70f6a1659bf1d9b3cb83a6bf7303167
+--- /dev/null
++++ b/src/destruct.h
+@@ -0,0 +1,72 @@
++#ifndef FALLOUT_DESTRUCT_H_
++#define FALLOUT_DESTRUCT_H_
++
++#include "geometry.h"
++#include "obj_types.h"
++
++namespace fallout {
++
++typedef enum DestructBlast {
++    DESTRUCT_BLAST_FIRE,
++    DESTRUCT_BLAST_PLASMA,
++    DESTRUCT_BLAST_EMP,
++} DestructBlast;
++
++// Explosions that break walls, scenery and roofs, with debris, fire, smoke,
++// a flash, screen shake and craters; art and settings are in
++// `wrecked-fallout-2/`. Damage, craters and grounded debris are kept per map,
++// in DESTRUCT.DAT next to the save game.
++void destructInit();
++void destructExit();
++// A new game: forgets every map's craters and debris.
++void destructReset();
++// After a map is loaded, and when the player leaves a map that isn't saved.
++void destructMapEnter();
++void destructMapForget(const char* mapName);
++// The slot's folder, as for SAVE.DAT.
++void destructSave(const char* directory);
++void destructLoad(const char* directory);
++
++// An explosion at `tile` that deals up to `damage` within `radius` hexes.
++void destructExplode(int tile, int elevation, int radius, int damage, DestructBlast blast);
++// The same as an animation callback: `data` from `destructPrepare`.
++void* destructPrepare(int tile, int elevation, int radius, int damage, DestructBlast blast);
++int destructExplodeCallback(void* data, void* unused);
++// From the test key: a beam from orbit at the mouse cursor, or a plain
++// explosion there when the beam is off in the settings.
++void destructExplodeAtCursor();
++void destructBeamAtCursor();
++// The beam at `tile`, following the cursor, or `steerTile` when not -1.
++void destructBeamAt(int tile, int elevation, int steerTile);
++// G: a meteor at the mouse cursor, or at `tile`.
++void destructMeteorAtCursor();
++void destructMeteorAt(int tile, int elevation);
++// From the game loop: sets off the beam's blasts and the meteor's impact.
++void destructGameUpdate();
++
++// Called by the map renderer: the ground marks after the floor, the flying
++// pieces grounded on `tile` after its objects, the flash after all objects.
++void destructRenderDecals(Rect* rect, int elevation);
++bool destructHasParticles(int elevation);
++void destructRenderTile(int tile, Rect* rect, int elevation);
++void destructRenderOverlay(Rect* rect, int elevation);
++// After roofs: the beam from orbit and the meteor.
++void destructRenderSky(Rect* rect, int elevation);
++
++// The object's art with what blasts did to it, or nullptr when it is whole.
++const unsigned char* destructDamagedFrame(Object* object, const unsigned char* data, int width, int height);
++// The same for the roof of a square.
++const unsigned char* destructDamagedRoof(int elevation, int square, int fid, const unsigned char* data, int width, int height);
++
++// How far the presented screen is shaken, in screen pixels.
++void destructShakeOffset(int* x, int* y);
++
++#ifdef WRECKED_TEST
++bool destructTestSnapshot(const char* path);
++int destructTestDecalCount();
++void destructTestDumpDamage(const char* directory);
++#endif
++
++} // namespace fallout
++
++#endif /* FALLOUT_DESTRUCT_H_ */

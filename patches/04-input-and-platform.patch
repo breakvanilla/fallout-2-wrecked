@@ -1,0 +1,254 @@
+diff --git a/src/dinput.cc b/src/dinput.cc
+index 171d52911665fb8cf499f4e9193c7c47958a58ea..0a49b5f3504e5875d97eb67d9f784f49f54168aa 100644
+--- a/src/dinput.cc
++++ b/src/dinput.cc
+@@ -4,6 +4,7 @@ namespace fallout {
+ 
+ static int gMouseWheelDeltaX = 0;
+ static int gMouseWheelDeltaY = 0;
++static unsigned int gMouseButtonPressedAt[2] = { 0, 0 };
+ 
+ // 0x4E0400
+ bool directInputInit()
+@@ -42,9 +43,50 @@ bool mouseDeviceUnacquire()
+     return true;
+ }
+ 
++// Wrecked Fallout 2: in relative mode macOS freezes the system cursor, and
++// SDL drops clicks whose frozen position is outside the window (fullscreen
++// black bars, the menu bar by the notch), so keep it mid-window.
++static void mouseKeepSystemCursorInWindow()
++{
++#ifdef WRECKED_TEST
++    // Test runs are hidden and must leave the user's cursor alone.
++    return;
++#endif
++
++    if (!SDL_GetRelativeMouseMode()) {
++        return;
++    }
++
++    SDL_Window* window = SDL_GetKeyboardFocus();
++    if (window == nullptr) {
++        return;
++    }
++
++    int windowX;
++    int windowY;
++    int windowWidth;
++    int windowHeight;
++    SDL_GetWindowPosition(window, &windowX, &windowY);
++    SDL_GetWindowSize(window, &windowWidth, &windowHeight);
++
++    int x;
++    int y;
++    SDL_GetGlobalMouseState(&x, &y);
++
++    const int margin = windowWidth / 4;
++    if (x < windowX + margin || x >= windowX + windowWidth - margin
++        || y < windowY + windowHeight / 4 || y >= windowY + windowHeight - windowHeight / 4) {
++        // `SDL_WarpMouseInWindow` only updates SDL's own position in
++        // relative mode, the global warp moves the system cursor.
++        SDL_WarpMouseGlobal(windowX + windowWidth / 2, windowY + windowHeight / 2);
++    }
++}
++
+ // 0x4E053C
+ bool mouseDeviceGetData(MouseData* mouseState)
+ {
++    mouseKeepSystemCursorInWindow();
++
+     // CE: This function is sometimes called outside loops calling `get_input`
+     // and subsequently `GNW95_process_message`, so mouse events might not be
+     // handled by SDL yet.
+@@ -54,8 +96,15 @@ bool mouseDeviceGetData(MouseData* mouseState)
+     SDL_PumpEvents();
+ 
+     Uint32 buttons = SDL_GetRelativeMouseState(&(mouseState->x), &(mouseState->y));
+-    mouseState->buttons[0] = (buttons & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0;
+-    mouseState->buttons[1] = (buttons & SDL_BUTTON(SDL_BUTTON_RIGHT)) != 0;
++    // Wrecked Fallout 2: report presses that were released before this poll
++    // (trackpad tap-to-click), otherwise they are lost; not ones from long
++    // ago, when the game stopped polling (cursor hidden).
++    unsigned int now = SDL_GetTicks();
++    for (int button = 0; button < 2; button++) {
++        bool recent = gMouseButtonPressedAt[button] != 0 && now - gMouseButtonPressedAt[button] < 250;
++        mouseState->buttons[button] = (buttons & SDL_BUTTON(button == 0 ? SDL_BUTTON_LEFT : SDL_BUTTON_RIGHT)) != 0 || recent;
++        gMouseButtonPressedAt[button] = 0;
++    }
+     mouseState->wheelX = gMouseWheelDeltaX;
+     mouseState->wheelY = gMouseWheelDeltaY;
+ 
+@@ -93,6 +142,10 @@ bool keyboardDeviceGetData(KeyboardData* keyboardData)
+ // 0x4E070C
+ bool mouseDeviceInit()
+ {
++#ifdef WRECKED_TEST
++    return true;
++#endif
++
+     return SDL_SetRelativeMouseMode(SDL_TRUE) == 0;
+ }
+ 
+@@ -117,6 +170,14 @@ void handleMouseEvent(SDL_Event* event)
+     // Mouse movement and buttons are accumulated in SDL itself and will be
+     // processed later in `mouseDeviceGetData` via `SDL_GetRelativeMouseState`.
+ 
++    if (event->type == SDL_MOUSEBUTTONDOWN) {
++        if (event->button.button == SDL_BUTTON_LEFT) {
++            gMouseButtonPressedAt[0] = SDL_GetTicks() | 1;
++        } else if (event->button.button == SDL_BUTTON_RIGHT) {
++            gMouseButtonPressedAt[1] = SDL_GetTicks() | 1;
++        }
++    }
++
+     if (event->type == SDL_MOUSEWHEEL) {
+         gMouseWheelDeltaX += event->wheel.x;
+         gMouseWheelDeltaY += event->wheel.y;
+diff --git a/src/file_find.cc b/src/file_find.cc
+index 8671df32c7951b937cf76a305b66fc2a90f3f9c8..603a70d91e60b23c3df368e903ba6727076b0edc 100644
+--- a/src/file_find.cc
++++ b/src/file_find.cc
+@@ -90,7 +90,7 @@ bool fileFindNext(DirectoryFileFindData* findData)
+ // 0x4E63CC
+ bool findFindClose(DirectoryFileFindData* findData)
+ {
+-#if defined(_MSC_VER)
++#if defined(_WIN32)
+     FindClose(findData->hFind);
+ #else
+     if (findData->dir != nullptr) {
+diff --git a/src/input.cc b/src/input.cc
+index 33acd6e4deb33c73317e1928f8d624e89f566a57..59745b05638099b18083fc865d00bcc83c56df6d 100644
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -918,13 +918,21 @@ void _GNW95_process_message()
+             handleMouseEvent(&e);
+             break;
+         case SDL_FINGERDOWN:
+-            touch_handle_start(&(e.tfinger));
+-            break;
+         case SDL_FINGERMOTION:
+-            touch_handle_move(&(e.tfinger));
+-            break;
+         case SDL_FINGERUP:
+-            touch_handle_end(&(e.tfinger));
++            // Wrecked Fallout 2: trackpads also report touches, they already
++            // drive the mouse and must not be treated as touchscreen gestures.
++            if (SDL_GetTouchDeviceType(e.tfinger.touchId) != SDL_TOUCH_DEVICE_DIRECT) {
++                break;
++            }
++
++            if (e.type == SDL_FINGERDOWN) {
++                touch_handle_start(&(e.tfinger));
++            } else if (e.type == SDL_FINGERMOTION) {
++                touch_handle_move(&(e.tfinger));
++            } else {
++                touch_handle_end(&(e.tfinger));
++            }
+             break;
+         case SDL_KEYDOWN:
+         case SDL_KEYUP:
+diff --git a/src/win32.cc b/src/win32.cc
+index 56e8881cb5d6d0481b4c24ca8cce0bfb570c7447..ae7bd536f3c0f61194e50c99e9121089c793f08e 100644
+--- a/src/win32.cc
++++ b/src/win32.cc
+@@ -1,6 +1,7 @@
+ #include "win32.h"
+ 
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include <SDL.h>
+ 
+@@ -16,8 +17,54 @@
+ #include "platform/ios/paths.h"
+ #endif
+ 
++#if __APPLE__ && TARGET_OS_OSX
++#include <CoreFoundation/CoreFoundation.h>
++#include <dlfcn.h>
++#include <limits.h>
++#endif
++
+ namespace fallout {
+ 
++#if __APPLE__ && TARGET_OS_OSX
++// Wrecked Fallout 2: the folder the app is in, also when macOS runs a
++// downloaded app from a read-only copy (App Translocation). The Security
++// framework's functions for that are not in its headers.
++static bool macAppFolder(char* path, size_t size)
++{
++    CFURLRef bundle = CFBundleCopyBundleURL(CFBundleGetMainBundle());
++    if (bundle == nullptr) {
++        return false;
++    }
++
++    CFURLRef app = bundle;
++    void* security = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
++    if (security != nullptr) {
++        typedef Boolean (*IsTranslocatedProc)(CFURLRef, bool*, CFErrorRef*);
++        typedef CFURLRef (*OriginalPathProc)(CFURLRef, CFErrorRef*);
++        IsTranslocatedProc isTranslocated = (IsTranslocatedProc)dlsym(security, "SecTranslocateIsTranslocatedURL");
++        OriginalPathProc originalPath = (OriginalPathProc)dlsym(security, "SecTranslocateCreateOriginalPathForURL");
++        bool translocated = false;
++        if (isTranslocated != nullptr && originalPath != nullptr && isTranslocated(bundle, &translocated, nullptr) && translocated) {
++            CFURLRef original = originalPath(bundle, nullptr);
++            if (original != nullptr) {
++                app = original;
++            }
++        }
++    }
++
++    CFURLRef folder = CFURLCreateCopyDeletingLastPathComponent(nullptr, app);
++    bool found = folder != nullptr && CFURLGetFileSystemRepresentation(folder, true, (UInt8*)path, size);
++    if (folder != nullptr) {
++        CFRelease(folder);
++    }
++    if (app != bundle) {
++        CFRelease(app);
++    }
++    CFRelease(bundle);
++    return found;
++}
++#endif
++
+ // 0x51E444
+ bool gProgramIsActive = false;
+ 
+@@ -30,6 +77,17 @@ int main(int argc, char* argv[])
+     int rc;
+ 
+ #if _WIN32
++    // The game's files are next to the exe, wherever it was started from.
++    char exePath[MAX_PATH];
++    DWORD exePathLength = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
++    if (exePathLength > 0 && exePathLength < MAX_PATH) {
++        char* slash = strrchr(exePath, '\\');
++        if (slash != nullptr) {
++            *slash = '\0';
++            SetCurrentDirectoryA(exePath);
++        }
++    }
++
+     GNW95_mutex = CreateMutexA(0, TRUE, "GNW95MUTEX");
+     if (GetLastError() != ERROR_SUCCESS) {
+         return 0;
+@@ -43,9 +101,14 @@ int main(int argc, char* argv[])
+ #endif
+ 
+ #if __APPLE__ && TARGET_OS_OSX
+-    char* basePath = SDL_GetBasePath();
+-    chdir(basePath);
+-    SDL_free(basePath);
++    char appFolder[PATH_MAX];
++    if (macAppFolder(appFolder, sizeof(appFolder))) {
++        chdir(appFolder);
++    } else {
++        char* basePath = SDL_GetBasePath();
++        chdir(basePath);
++        SDL_free(basePath);
++    }
+ #endif
+ 
+ #if __ANDROID__

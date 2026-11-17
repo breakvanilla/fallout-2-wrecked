@@ -1,0 +1,601 @@
+diff --git a/src/actions.cc b/src/actions.cc
+index 99ded11f7a085f955524ff19b1e568955b1352b3..bd111bffb18efba4723b140e48a81a5c553de0b8 100644
+--- a/src/actions.cc
++++ b/src/actions.cc
+@@ -11,6 +11,7 @@
+ #include "config.h"
+ #include "critter.h"
+ #include "debug.h"
++#include "destruct.h"
+ #include "display_monitor.h"
+ #include "game.h"
+ #include "game_sound.h"
+@@ -845,7 +846,17 @@ int _action_ranged(Attack* attack, int anim)
+                         animationRegisterSetFid(projectile, explosionFid, -1);
+ 
+                         const char* sfx = sfxBuildWeaponName(WEAPON_SOUND_EFFECT_HIT, weapon, attack->hitMode, attack->defender);
+-                        animationRegisterPlaySoundEffect(projectile, sfx, 0);
++                        int blastMinDamage;
++                        int blastMaxDamage;
++                        weaponGetDamageMinMax(weapon, &blastMinDamage, &blastMaxDamage);
++                        DestructBlast blast = DESTRUCT_BLAST_FIRE;
++                        if (isGrenade && damageType == DAMAGE_TYPE_EMP) {
++                            blast = DESTRUCT_BLAST_EMP;
++                        } else if (isGrenade && damageType == DAMAGE_TYPE_PLASMA) {
++                            blast = DESTRUCT_BLAST_PLASMA;
++                        }
++                        int blastRadius = isGrenade ? weaponGetGrenadeExplosionRadius(weapon) : weaponGetRocketExplosionRadius(weapon);
++                        animationRegisterPlayExplosionSound(projectile, sfx, 0, destructPrepare(explosionCenterTile, projectile->elevation, blastRadius, blastMaxDamage, blast));
+ 
+                         // SFALL
+                         if (explosionEmitsLight()) {
+@@ -1661,7 +1672,7 @@ int actionExplode(int tile, int elevation, int minDamage, int maxDamage, Object*
+ 
+         reg_anim_begin(ANIMATION_REQUEST_RESERVED);
+         _register_priority(1);
+-        animationRegisterPlaySoundEffect(explosion, "whn1xxx1", 0);
++        animationRegisterPlayExplosionSound(explosion, "whn1xxx1", 0, destructPrepare(tile, elevation, 2, maxDamage, DESTRUCT_BLAST_FIRE));
+         animationRegisterUnsetFlag(explosion, OBJECT_HIDDEN, 0);
+         animationRegisterAnimateAndHide(explosion, ANIM_STAND, 0);
+         _show_damage(attack, 0, 1);
+@@ -1713,6 +1724,8 @@ int actionExplode(int tile, int elevation, int minDamage, int maxDamage, Object*
+ 
+         _combat_explode_scenery(explosion, nullptr);
+ 
++        destructExplode(tile, elevation, 2, maxDamage, DESTRUCT_BLAST_FIRE);
++
+         objectDestroy(explosion, nullptr);
+ 
+         for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+diff --git a/src/animation.cc b/src/animation.cc
+index 0884eb28815718b6e29877db50cf0f424acc6c31..a8f5100b3a70ff204fc1b39f261da1f8ab58f276 100644
+--- a/src/animation.cc
++++ b/src/animation.cc
+@@ -9,6 +9,7 @@
+ #include "combat_ai.h"
+ #include "critter.h"
+ #include "debug.h"
++#include "destruct.h"
+ #include "display_monitor.h"
+ #include "game.h"
+ #include "game_mouse.h"
+@@ -262,6 +263,7 @@ static int _anim_free_slot(int a1);
+ static int _anim_preload(Object* object, int fid, CacheEntry** cacheEntryPtr);
+ static void _anim_cleanup();
+ static int _check_registry(Object* obj);
++static int explosionSoundCallback(void* sound, void* blast);
+ static int animationRunSequence(int a1);
+ static int _anim_set_continue(int a1, int a2);
+ static int _anim_set_end(int a1);
+@@ -535,6 +537,10 @@ static void _anim_cleanup()
+         if (animationDescription->kind == ANIM_KIND_CALLBACK && animationDescription->callback == (AnimationCallback*)_gsnd_anim_sound) {
+             soundEffectDelete((Sound*)animationDescription->param1);
+         }
++
++        if (animationDescription->kind == ANIM_KIND_CALLBACK && animationDescription->callback == explosionSoundCallback && animationDescription->param1 != nullptr) {
++            soundEffectDelete((Sound*)animationDescription->param1);
++        }
+     }
+ 
+     gAnimationSequenceCurrentIndex = -1;
+@@ -1260,6 +1266,46 @@ int animationRegisterToggleOutline(Object* object, bool outline, int delay)
+     return 0;
+ }
+ 
++// Explosion sound and blast in one step, so the sequence needs no extra step.
++static int explosionSoundCallback(void* sound, void* blast)
++{
++    if (sound != nullptr) {
++        _gsnd_anim_sound((Sound*)sound, nullptr);
++    }
++    destructExplodeCallback(blast, nullptr);
++    return 0;
++}
++
++int animationRegisterPlayExplosionSound(Object* owner, const char* soundEffectName, int delay, void* blast)
++{
++    if (blast == nullptr) {
++        return animationRegisterPlaySoundEffect(owner, soundEffectName, delay);
++    }
++
++    if (_check_registry(owner) == -1) {
++        _anim_cleanup();
++        return -1;
++    }
++
++    AnimationSequence* animationSequence = &(gAnimationSequences[gAnimationSequenceCurrentIndex]);
++    AnimationDescription* animationDescription = &(animationSequence->animations[gAnimationDescriptionCurrentIndex]);
++    animationDescription->kind = ANIM_KIND_CALLBACK;
++    animationDescription->owner = owner;
++    animationDescription->param1 = nullptr;
++    if (soundEffectName != nullptr) {
++        int volume = _gsound_compute_relative_volume(owner);
++        animationDescription->param1 = soundEffectLoadWithVolume(soundEffectName, owner, volume);
++    }
++    animationDescription->param2 = blast;
++    animationDescription->callback = explosionSoundCallback;
++    animationDescription->artCacheKey = nullptr;
++    animationDescription->delay = delay;
++
++    gAnimationDescriptionCurrentIndex++;
++
++    return 0;
++}
++
+ // 0x41541C
+ int animationRegisterPlaySoundEffect(Object* owner, const char* soundEffectName, int delay)
+ {
+@@ -1644,6 +1690,10 @@ static int _anim_set_end(int animationSequenceIndex)
+                 if (animationDescription->kind == ANIM_KIND_CALLBACK && animationDescription->callback == (AnimationCallback*)_gsnd_anim_sound) {
+                     soundEffectDelete((Sound*)animationDescription->param1);
+                 }
++
++                if (animationDescription->kind == ANIM_KIND_CALLBACK && animationDescription->callback == explosionSoundCallback && animationDescription->param1 != nullptr) {
++                    soundEffectDelete((Sound*)animationDescription->param1);
++                }
+             }
+         }
+     }
+diff --git a/src/animation.h b/src/animation.h
+index b5293a02752a29cf09eee4807363445482e879cd..0b98a6eaed131860265a2761efa5f8678470c527 100644
+--- a/src/animation.h
++++ b/src/animation.h
+@@ -132,6 +132,7 @@ int animationRegisterRotateCounterClockwise(Object* owner);
+ int animationRegisterHideObject(Object* object);
+ int animationRegisterHideObjectForced(Object* object);
+ int animationRegisterCallback(void* a1, void* a2, AnimationCallback* proc, int delay);
++int animationRegisterPlayExplosionSound(Object* owner, const char* soundEffectName, int delay, void* blast);
+ int animationRegisterCallback3(void* a1, void* a2, void* a3, AnimationCallback3* proc, int delay);
+ int animationRegisterCallbackForced(void* a1, void* a2, AnimationCallback* proc, int delay);
+ int animationRegisterSetFlag(Object* object, int flag, int delay);
+diff --git a/src/game.cc b/src/game.cc
+index 978a3859cdf3cb7cbf4c4feffbd203a430afe26b..764ded03a84940c722fabbf6a3099a9b2fd6bfa2 100644
+--- a/src/game.cc
++++ b/src/game.cc
+@@ -20,6 +20,7 @@
+ #include "display_monitor.h"
+ #include "draw.h"
+ #include "endgame.h"
++#include "destruct.h"
+ #include "font_manager.h"
+ #include "game_dialog.h"
+ #include "game_memory.h"
+@@ -406,6 +407,7 @@ void gameReset()
+     movieEffectsReset();
+     gameMoviesReset();
+     isoReset();
++    destructReset();
+     gameMouseReset();
+     protoReset();
+     _scr_reset();
+@@ -486,6 +488,10 @@ void gameExit()
+ // 0x442D44
+ int gameHandleKey(int eventCode, bool isInCombatMode)
+ {
++    // Wrecked Fallout 2: the beam's blasts and the meteor's impact, from the
++    // game loop so they can hurt people.
++    destructGameUpdate();
++
+     // NOTE: Uninline.
+     if (gameGetState() == GAME_STATE_5) {
+         _gdialogSystemEnter();
+@@ -735,6 +741,18 @@ int gameHandleKey(int eventCode, bool isInCombatMode)
+             }
+         }
+         break;
++    case KEY_UPPERCASE_X:
++    case KEY_LOWERCASE_X:
++        if (interfaceBarEnabled()) {
++            destructExplodeAtCursor();
++        }
++        break;
++    case KEY_UPPERCASE_G:
++    case KEY_LOWERCASE_G:
++        if (interfaceBarEnabled()) {
++            destructMeteorAtCursor();
++        }
++        break;
+     case KEY_HOME:
+         if (gDude->elevation != gElevation) {
+             mapSetElevation(gDude->elevation);
+diff --git a/src/loadsave.cc b/src/loadsave.cc
+index f352c35f493262a85add8b7e4dd120519bf957f3..75a19c1b1773e43ddcdb2a3e5e429be7bf0ffdab 100644
+--- a/src/loadsave.cc
++++ b/src/loadsave.cc
+@@ -18,6 +18,7 @@
+ #include "db.h"
+ #include "dbox.h"
+ #include "debug.h"
++#include "destruct.h"
+ #include "delay.h"
+ #include "display_monitor.h"
+ #include "draw.h"
+@@ -1675,6 +1676,7 @@ static int lsgPerformSaveGame()
+     }
+ 
+     snprintf(_gmpath, sizeof(_gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", _slot_cursor + 1);
++    destructSave(_gmpath);
+     MapDirErase(_gmpath, "BAK");
+ 
+     gLoadSaveMessageListItem.num = 140;
+@@ -1695,6 +1697,26 @@ bool _isLoadingGame()
+     return _loadingGame;
+ }
+ 
++#ifdef WRECKED_TEST
++int lsgTestLoad(int slot)
++{
++    _slot_cursor = slot;
++    return lsgLoadGameInSlot(slot);
++}
++
++int lsgTestSave(int slot, const char* description)
++{
++    static unsigned char preview[LS_PREVIEW_SIZE];
++    _slot_cursor = slot;
++    strncpy(_LSData[slot].description, description != nullptr ? description : "", LOAD_SAVE_DESCRIPTION_LENGTH - 1);
++    _LSData[slot].description[LOAD_SAVE_DESCRIPTION_LENGTH - 1] = '\0';
++    if (_snapshotBuf == nullptr) {
++        _snapshotBuf = preview;
++    }
++    return lsgPerformSaveGame();
++}
++#endif
++
+ // 0x47DC68
+ static int lsgLoadGameInSlot(int slot)
+ {
+@@ -1767,6 +1789,10 @@ static int lsgLoadGameInSlot(int slot)
+         fileClose(_flptr);
+     }
+ 
++    snprintf(_gmpath, sizeof(_gmpath), "%s\\%s%.2d\\", "SAVEGAME", "SLOT", _slot_cursor + 1);
++    destructLoad(_gmpath);
++    tileWindowRefresh();
++
+     snprintf(_str, sizeof(_str), "%s\\", "MAPS");
+     MapDirErase(_str, "BAK");
+     _proto_dude_update_gender();
+diff --git a/src/loadsave.h b/src/loadsave.h
+index 567548e4a2f7a666b2f67f49b66780d925b1b270..d11f8aefc35afc9904565cf6ea80a1a9d15643c5 100644
+--- a/src/loadsave.h
++++ b/src/loadsave.h
+@@ -23,6 +23,12 @@ void lsgInit();
+ int MapDirErase(const char* path, const char* extension);
+ int _MapDirEraseFile_(const char* a1, const char* a2);
+ 
++#ifdef WRECKED_TEST
++// Loads save slot `slot` (0 based) without the dialog.
++int lsgTestLoad(int slot);
++int lsgTestSave(int slot, const char* description = nullptr);
++#endif
++
+ } // namespace fallout
+ 
+ #endif /* LOAD_SAVE_GAME_H */
+diff --git a/src/map.cc b/src/map.cc
+index e73109f0ef43da204ce93c0e3a202a34c483bbd9..3fbbadc6dfb14df1572db8d3ef1737234e2cbfca 100644
+--- a/src/map.cc
++++ b/src/map.cc
+@@ -18,6 +18,7 @@
+ #include "elevator.h"
+ #include "game.h"
+ #include "game_mouse.h"
++#include "destruct.h"
+ #include "game_movie.h"
+ #include "game_sound.h"
+ #include "input.h"
+@@ -197,6 +198,8 @@ int isoInit()
+         return -1;
+     }
+ 
++    destructInit();
++
+     if (artInit() != 0) {
+         debugPrint("art_init failed in iso_init\n");
+         return -1;
+@@ -270,6 +273,7 @@ void isoExit()
+     tileExit();
+     artExit();
+ 
++    destructExit();
+     windowDestroy(gIsoWindow);
+ 
+     // NOTE: Uninline.
+@@ -738,6 +742,7 @@ void mapNewMap()
+     gMapHeader.enteringTile = 20100;
+     _obj_remove_all();
+     animationStop();
++    destructMapEnter();
+ 
+     // NOTE: Uninline.
+     mapGlobalVariablesFree();
+@@ -992,6 +997,7 @@ err:
+         rc = -1;
+     } else {
+         _obj_preload_art_cache(gMapHeader.flags);
++        destructMapEnter();
+     }
+ 
+     _partyMemberRecoverLoad();
+@@ -1456,6 +1462,7 @@ int _map_save_in_game(bool a1)
+     if (a1 && !wmMapIsSaveable()) {
+         debugPrint("\nNot saving RANDOM encounter map.");
+ 
++        destructMapForget(gMapHeader.name);
+         strcpy(name, gMapHeader.name);
+         _strmfe(gMapHeader.name, name, "SAV");
+         _MapDirEraseFile_("MAPS\\", gMapHeader.name);
+diff --git a/src/object.cc b/src/object.cc
+index 20b7aeffe1f58b947f2885f1ecd751cb41737c9f..a4ae94af99ccd573304007e3fad0bad8ed85aaa3 100644
+--- a/src/object.cc
++++ b/src/object.cc
+@@ -14,6 +14,7 @@
+ #include "draw.h"
+ #include "game.h"
+ #include "game_mouse.h"
++#include "destruct.h"
+ #include "item.h"
+ #include "light.h"
+ #include "map.h"
+@@ -92,6 +93,10 @@ static int* _offsetModTable = nullptr;
+ // 0x519620
+ static ObjectListNode** _renderTable = nullptr;
+ 
++// Tile of each `_renderTable` entry while explosion debris is flying: then
++// every tile in the update area gets an entry.
++static int* _renderTiles = nullptr;
++
+ // Number of objects in _outlinedObjects.
+ //
+ // 0x519624
+@@ -781,6 +786,9 @@ void _obj_render_pre_roof(Rect* rect, int elevation)
+ 
+     _outlineCount = 0;
+ 
++    destructRenderDecals(&updatedRect, elevation);
++    bool particles = _renderTiles != nullptr && destructHasParticles(elevation);
++
+     int renderCount = 0;
+     for (int i = 0; i < gObjectsUpdateAreaHexSize; i++) {
+         int offsetIndex = _orderTable[parity][i];
+@@ -820,7 +828,10 @@ void _obj_render_pre_roof(Rect* rect, int elevation)
+                 objectListNode = objectListNode->next;
+             }
+ 
+-            if (objectListNode != nullptr) {
++            if (particles && hexGridTileIsValid(tile)) {
++                _renderTiles[renderCount] = tile;
++                _renderTable[renderCount++] = objectListNode;
++            } else if (objectListNode != nullptr) {
+                 _renderTable[renderCount++] = objectListNode;
+             }
+         }
+@@ -855,7 +866,13 @@ void _obj_render_pre_roof(Rect* rect, int elevation)
+ 
+             objectListNode = objectListNode->next;
+         }
++
++        if (particles) {
++            destructRenderTile(_renderTiles[i], &updatedRect, elevation);
++        }
+     }
++
++    destructRenderOverlay(&updatedRect, elevation);
+ }
+ 
+ // 0x4897EC
+@@ -884,6 +901,8 @@ void _obj_render_post_roof(Rect* rect, int elevation)
+         }
+         objectListNode = objectListNode->next;
+     }
++
++    destructRenderSky(&updatedRect, elevation);
+ }
+ 
+ // 0x489A84
+@@ -3415,6 +3434,8 @@ static int _obj_render_table_init()
+         _renderTable[index] = nullptr;
+     }
+ 
++    _renderTiles = (int*)internal_malloc(sizeof(*_renderTiles) * gObjectsUpdateAreaHexSize);
++
+     return 0;
+ }
+ 
+@@ -3427,6 +3448,11 @@ static void _obj_render_table_exit()
+         internal_free(_renderTable);
+         _renderTable = nullptr;
+     }
++
++    if (_renderTiles != nullptr) {
++        internal_free(_renderTiles);
++        _renderTiles = nullptr;
++    }
+ }
+ 
+ // 0x48D020
+@@ -4928,6 +4954,11 @@ static void _obj_render_object(Object* object, Rect* rect, int light)
+     }
+ 
+     unsigned char* src = artGetFrameData(art, object->frame, object->rotation);
++    // Walls and scenery hurt by explosions.
++    const unsigned char* damaged = destructDamagedFrame(object, src, frameWidth, frameHeight);
++    if (damaged != nullptr) {
++        src = (unsigned char*)damaged;
++    }
+     unsigned char* src2 = src;
+     int v50 = objectRect.left - object->sx;
+     int v49 = objectRect.top - object->sy;
+diff --git a/src/svga.cc b/src/svga.cc
+index 8acca9665e27a8d53276b39c9a5614301d58b9b9..625d8b2b5c9bdafd7c6d3a33bb787732939406b5 100644
+--- a/src/svga.cc
++++ b/src/svga.cc
+@@ -6,6 +6,7 @@
+ #include <SDL.h>
+ 
+ #include "config.h"
++#include "destruct.h"
+ #include "draw.h"
+ #include "interface.h"
+ #include "memory.h"
+@@ -177,6 +178,11 @@ int _GNW95_init_window(int width, int height, bool fullscreen, int scale)
+ 
+         Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_ALLOW_HIGHDPI;
+ 
++#ifdef WRECKED_TEST
++        windowFlags |= SDL_WINDOW_HIDDEN;
++        fullscreen = false;
++#endif
++
+         if (fullscreen) {
+             windowFlags |= SDL_WINDOW_FULLSCREEN;
+         }
+@@ -409,9 +415,14 @@ void handleWindowSizeChanged()
+ 
+ void renderPresent()
+ {
++    int shakeX;
++    int shakeY;
++    destructShakeOffset(&shakeX, &shakeY);
++    SDL_Rect shaken = { shakeX, shakeY, gSdlTextureSurface->w, gSdlTextureSurface->h };
++
+     SDL_UpdateTexture(gSdlTexture, nullptr, gSdlTextureSurface->pixels, gSdlTextureSurface->pitch);
+     SDL_RenderClear(gSdlRenderer);
+-    SDL_RenderCopy(gSdlRenderer, gSdlTexture, nullptr, nullptr);
++    SDL_RenderCopy(gSdlRenderer, gSdlTexture, nullptr, shakeX != 0 || shakeY != 0 ? &shaken : nullptr);
+     SDL_RenderPresent(gSdlRenderer);
+ }
+ 
+diff --git a/src/tile.cc b/src/tile.cc
+index 0ac02c41ed2ce39b4cd38bc2b0fb8d6f14ba29d1..d7bca81f9be851db83e547f0606631ae217d3218 100644
+--- a/src/tile.cc
++++ b/src/tile.cc
+@@ -11,6 +11,7 @@
+ #include "color.h"
+ #include "config.h"
+ #include "debug.h"
++#include "destruct.h"
+ #include "draw.h"
+ #include "game_mouse.h"
+ #include "light.h"
+@@ -60,7 +61,7 @@ static void tileRefreshMapper(Rect* rect, int elevation);
+ static void tileRefreshGame(Rect* rect, int elevation);
+ static void roof_fill_push_task_if_in_bounds(std::stack<roof_fill_task>& tasks_stack, int x, int y);
+ static void roof_fill_off_process_task(std::stack<roof_fill_task>& tasks_stack, int elevation, bool on);
+-static void tileRenderRoof(int fid, int x, int y, Rect* rect, int light);
++static void tileRenderRoof(int fid, int x, int y, Rect* rect, int light, int elevation, int squareTile);
+ static void _draw_grid(int tile, int elevation, Rect* rect);
+ static void tileRenderFloor(int fid, int x, int y, Rect* rect);
+ static int _tile_make_line(int currentCenterTile, int newCenterTile, int* tiles, int tilesCapacity);
+@@ -1267,7 +1268,7 @@ void tileRenderRoofsInRect(Rect* rect, int elevation)
+                     int screenX;
+                     int screenY;
+                     squareTileToRoofScreenXY(squareTile, &screenX, &screenY, elevation);
+-                    tileRenderRoof(fid, screenX, screenY, rect, light);
++                    tileRenderRoof(fid, screenX, screenY, rect, light, elevation, squareTile);
+                 }
+             }
+         }
+@@ -1325,7 +1326,7 @@ void tile_fill_roof(int x, int y, int elevation, bool on)
+ }
+ 
+ // 0x4B24E0
+-static void tileRenderRoof(int fid, int x, int y, Rect* rect, int light)
++static void tileRenderRoof(int fid, int x, int y, Rect* rect, int light, int elevation, int squareTile)
+ {
+     CacheEntry* tileFrmHandle;
+     Art* tileFrm = artLock(fid, &tileFrmHandle);
+@@ -1344,6 +1345,11 @@ static void tileRenderRoof(int fid, int x, int y, Rect* rect, int light)
+ 
+     if (rectIntersection(&tileRect, rect, &tileRect) == 0) {
+         unsigned char* tileFrmBuffer = artGetFrameData(tileFrm, 0, 0);
++        // Roofs broken by explosions.
++        const unsigned char* damaged = destructDamagedRoof(elevation, squareTile, fid, tileFrmBuffer, tileWidth, tileHeight);
++        if (damaged != nullptr) {
++            tileFrmBuffer = (unsigned char*)damaged;
++        }
+         tileFrmBuffer += tileWidth * (tileRect.top - y) + (tileRect.left - x);
+ 
+         CacheEntry* eggFrmHandle;
+@@ -1514,6 +1520,11 @@ bool _square_roof_intersect(int x, int y, int elevation)
+                     squareTileToRoofScreenXY(idx, &v18, &v17, elevation);
+ 
+                     int width = artGetWidth(art, 0, 0);
++                    // Not where an explosion broke through.
++                    const unsigned char* damaged = destructDamagedRoof(elevation, idx, fid, data, width, artGetHeight(art, 0, 0));
++                    if (damaged != nullptr) {
++                        data = (unsigned char*)damaged;
++                    }
+                     if (data[width * (y - v17) + x - v18] != 0) {
+                         result = true;
+                     }
+@@ -1526,6 +1537,56 @@ bool _square_roof_intersect(int x, int y, int elevation)
+     return result;
+ }
+ 
++// Whether the roof, ignoring holes broken in it, covers this point of the map
++// window. Roof tiles overlap, so neighbouring squares are checked too.
++bool tileRoofCovers(int x, int y, int elevation)
++{
++    if (!gTileRoofIsVisible) {
++        return false;
++    }
++
++    int centerX;
++    int centerY;
++    squareTileScreenToCoordRoof(x, y, elevation, &centerX, &centerY);
++    int gridHeight = gSquareGridSize / gSquareGridWidth;
++    for (int tileY = centerY - 2; tileY <= centerY + 2; tileY++) {
++        for (int tileX = centerX - 2; tileX <= centerX + 2; tileX++) {
++            if (tileX < 0 || tileX >= gSquareGridWidth || tileY < 0 || tileY >= gridHeight) {
++                continue;
++            }
++
++            int idx = gSquareGridWidth * tileY + tileX;
++            int upper = gTileSquares[elevation]->field_0[idx] >> 16;
++            int fid = buildFid(OBJ_TYPE_TILE, upper & 0xFFF, 0, 0, 0);
++            if (fid == buildFid(OBJ_TYPE_TILE, 1, 0, 0, 0) || (((upper & 0xF000) >> 12) & 1) != 0) {
++                continue;
++            }
++
++            bool covered = false;
++            CacheEntry* handle;
++            Art* art = artLock(fid, &handle);
++            if (art != nullptr) {
++                unsigned char* data = artGetFrameData(art, 0, 0);
++                int width = artGetWidth(art, 0, 0);
++                int height = artGetHeight(art, 0, 0);
++                int roofX;
++                int roofY;
++                squareTileToRoofScreenXY(idx, &roofX, &roofY, elevation);
++                int px = x - roofX;
++                int py = y - roofY;
++                if (data != nullptr && px >= 0 && px < width && py >= 0 && py < height) {
++                    covered = data[width * py + px] != 0;
++                }
++                artUnlock(handle);
++            }
++            if (covered) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ // 0x4B2E98
+ void _grid_render(Rect* rect, int elevation)
+ {
+diff --git a/src/tile.h b/src/tile.h
+index 97acc8fa770f3939ae6f81f2f0998db392a87a2c..9a770cb7b20269eb42ca073ccd77603f6ecb3aff 100644
+--- a/src/tile.h
++++ b/src/tile.h
+@@ -52,6 +52,7 @@ void tileRenderRoofsInRect(Rect* rect, int elevation);
+ void tile_fill_roof(int x, int y, int elevation, bool on);
+ void tileRenderFloorsInRect(Rect* rect, int elevation);
+ bool _square_roof_intersect(int x, int y, int elevation);
++bool tileRoofCovers(int x, int y, int elevation);
+ void _grid_render(Rect* rect, int elevation);
+ int _tile_scroll_to(int tile, int flags);
+ 

@@ -21,6 +21,8 @@ The beam and the meteor are the game's own explosions: they throw people back an
 <tr><td><img src="docs/04-beam-hits-brahmin-pen.gif" width="100%" alt="The beam hits the brahmin pen"><br>The beam hits the brahmin pen</td><td><img src="docs/07-meteors-hit-geckos-in-wasteland.gif" width="100%" alt="Meteors vs geckos"><br>Meteors vs geckos</td></tr>
 </table>
 
+Gameplay video with the mod, no commentary: [Klamath](https://youtu.be/dT1YmInorLg).
+
 Website: [breakvanilla.com](https://breakvanilla.com/). Videos: [youtube.com/@BreakVanilla](https://www.youtube.com/@BreakVanilla).
 
 ## Install

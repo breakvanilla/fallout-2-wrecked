@@ -68,7 +68,7 @@ index 99ded11f7a085f955524ff19b1e568955b1352b3..1bee8f1c363f49eed2a24dbace82a16a
  
          for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
 diff --git a/src/animation.cc b/src/animation.cc
-index 0884eb28815718b6e29877db50cf0f424acc6c31..18701b56f3f1c46d84a05587796d1bdf8ced958a 100644
+index 0884eb28815718b6e29877db50cf0f424acc6c31..a8f5100b3a70ff204fc1b39f261da1f8ab58f276 100644
 --- a/src/animation.cc
 +++ b/src/animation.cc
 @@ -9,6 +9,7 @@
@@ -87,15 +87,6 @@ index 0884eb28815718b6e29877db50cf0f424acc6c31..18701b56f3f1c46d84a05587796d1bdf
  static int animationRunSequence(int a1);
  static int _anim_set_continue(int a1, int a2);
  static int _anim_set_end(int a1);
-@@ -483,7 +485,7 @@ int reg_anim_end()
-     animationSequence->animationIndex = -1;
-     animationSequence->flags &= ~ANIM_SEQ_ACCUMULATING;
-     animationSequence->animations[0].delay = 0;
--    if (isInCombat()) {
-+    if (isInCombat() || combatAttackOutside()) {
-         _combat_anim_begin();
-         animationSequence->flags |= ANIM_SEQ_COMBAT_ANIM_STARTED;
-     }
 @@ -535,6 +537,10 @@ static void _anim_cleanup()
          if (animationDescription->kind == ANIM_KIND_CALLBACK && animationDescription->callback == (AnimationCallback*)_gsnd_anim_sound) {
              soundEffectDelete((Sound*)animationDescription->param1);
@@ -177,6 +168,29 @@ index b5293a02752a29cf09eee4807363445482e879cd..0b98a6eaed131860265a2761efa5f867
  int animationRegisterCallback3(void* a1, void* a2, void* a3, AnimationCallback3* proc, int delay);
  int animationRegisterCallbackForced(void* a1, void* a2, AnimationCallback* proc, int delay);
  int animationRegisterSetFlag(Object* object, int flag, int delay);
+diff --git a/src/art.cc b/src/art.cc
+index 205b360952d9a9b7ab10d1d829397b39fe4a02df..9cfcec3098f7ea39aa88eb370ee3cd303bdde337 100644
+--- a/src/art.cc
++++ b/src/art.cc
+@@ -1,5 +1,6 @@
+ #include "art.h"
+ 
++#include <algorithm>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -134,7 +135,10 @@ int artInit()
+     File* stream;
+     char string[200];
+ 
+-    int cacheSize = settings.system.art_cache_size;
++    // Wrecked Fallout 2: at least 64 MB. The game's 8 MB cannot hold the art of
++    // a large window, and a blast that brings in new art then reloads hundreds
++    // of files at once.
++    int cacheSize = std::max(settings.system.art_cache_size, 64);
+     if (!cacheInit(&gArtCache, artCacheGetFileSizeImpl, artCacheReadDataImpl, artCacheFreeImpl, cacheSize << 20)) {
+         debugPrint("cache_init failed in art_init\n");
+         return -1;
 diff --git a/src/audio_engine.cc b/src/audio_engine.cc
 index 6523c5cfd438a5996451bce62e0879c40ad94181..30b7d439190a5d001d06c03842c7eec3090944e5 100644
 --- a/src/audio_engine.cc
@@ -212,28 +226,10 @@ index 3893e21ea5aecbf281d52701330b8bdec2474744..607931361cbb56543d54e65191d70aa6
      } while (r >= l);
  
 diff --git a/src/combat.cc b/src/combat.cc
-index 825a57343fe68b3870df43e098a3d8a2f722b843..600aeedd27b3ac2894478dbd24278aa88433eb97 100644
+index 825a57343fe68b3870df43e098a3d8a2f722b843..45cdc550460b36bf0a7a6bbc72fe5f629fe31189 100644
 --- a/src/combat.cc
 +++ b/src/combat.cc
-@@ -12,6 +12,7 @@
- #include "critter.h"
- #include "db.h"
- #include "debug.h"
-+#include "destruct.h"
- #include "display_monitor.h"
- #include "draw.h"
- #include "elevator.h"
-@@ -1953,6 +1954,9 @@ static int _list_com;
- // 0x56D398
- static int _combat_exps;
- 
-+// The player's attack outside combat is being set up.
-+static bool gCombatAttackOutside = false;
-+
- // bonus action points from BONUS_MOVE perk.
- //
- // 0x56D39C
-@@ -2098,9 +2102,9 @@ int combatLoad(File* stream)
+@@ -2098,9 +2098,9 @@ int combatLoad(File* stream)
          Object* obj = objectFindFirst();
          while (obj != nullptr) {
              if (PID_TYPE(obj->pid) == OBJ_TYPE_CRITTER) {
@@ -246,114 +242,6 @@ index 825a57343fe68b3870df43e098a3d8a2f722b843..600aeedd27b3ac2894478dbd24278aa8
              }
              obj = objectFindNext();
          }
-@@ -3377,6 +3381,17 @@ static bool _combat_should_end()
- // 0x422D2C
- void _combat(CombatStartData* csd)
- {
-+    // Peaceful: no combat starts; a save made in combat still goes on with it.
-+    if (destructPeaceful() && (gCombatState & COMBAT_STATE_0x01) == 0) {
-+#ifdef WRECKED_TEST
-+        fprintf(stderr, "destruct: combat blocked\n");
-+#endif
-+        return;
-+    }
-+#ifdef WRECKED_TEST
-+    fprintf(stderr, "destruct: combat starts\n");
-+#endif
-+
-     ScopedGameMode gm(GameMode::kCombat);
- 
-     if (csd == nullptr
-@@ -5362,6 +5377,11 @@ void _combat_anim_finished()
- 
-         _apply_damage(&_main_ctd, true);
- 
-+        if (!isInCombat() && _combat_exps != 0) {
-+            _combat_give_exps(_combat_exps);
-+            _combat_exps = 0;
-+        }
-+
-         Object* attacker = _main_ctd.attacker;
-         if (attacker == gDude && _combat_highlight == 2) {
-             _combat_outline_on();
-@@ -5711,6 +5731,24 @@ bool _combat_to_hit(Object* target, int* accuracy)
-     return true;
- }
- 
-+// The player's attack; `outside` runs it at once, outside combat.
-+static void combatDudeAttack(Object* target, int hitMode, int hitLocation, bool outside)
-+{
-+    gCombatAttackOutside = outside;
-+    _combat_attack(gDude, target, hitMode, hitLocation);
-+    gCombatAttackOutside = false;
-+
-+    if (outside) {
-+        gDude->data.critter.combat.ap = critterGetStat(gDude, STAT_MAXIMUM_ACTION_POINTS);
-+        interfaceRenderActionPoints(0, 0);
-+    }
-+}
-+
-+bool combatAttackOutside()
-+{
-+    return gCombatAttackOutside;
-+}
-+
- // 0x4267CC
- void _combat_attack_this(Object* target)
- {
-@@ -5728,6 +5766,11 @@ void _combat_attack_this(Object* target)
-         return;
-     }
- 
-+    bool outside = !isInCombat() && destructPeaceful();
-+    if (outside) {
-+        gDude->data.critter.combat.ap = critterGetStat(gDude, STAT_MAXIMUM_ACTION_POINTS);
-+    }
-+
-     MessageListItem messageListItem;
-     Object* item;
-     char formattedText[80];
-@@ -5782,7 +5825,7 @@ void _combat_attack_this(Object* target)
-         return;
-     }
- 
--    if (!isInCombat()) {
-+    if (!isInCombat() && !outside) {
-         CombatStartData combat;
-         combat.attacker = gDude;
-         combat.defender = target;
-@@ -5797,7 +5840,7 @@ void _combat_attack_this(Object* target)
-     }
- 
-     if (!aiming) {
--        _combat_attack(gDude, target, hitMode, HIT_LOCATION_UNCALLED);
-+        combatDudeAttack(target, hitMode, HIT_LOCATION_UNCALLED, outside);
-         return;
-     }
- 
-@@ -5807,7 +5850,7 @@ void _combat_attack_this(Object* target)
- 
-     int hitLocation;
-     if (calledShotSelectHitLocation(target, &hitLocation, hitMode) != -1) {
--        _combat_attack(gDude, target, hitMode, hitLocation);
-+        combatDudeAttack(target, hitMode, hitLocation, outside);
-     }
- }
- 
-diff --git a/src/combat.h b/src/combat.h
-index 7935844b9cc9f77284952108f45d2e0c1a06b764..a9a03f61a6f0c2448a7dab8afc4d519fc36a47a0 100644
---- a/src/combat.h
-+++ b/src/combat.h
-@@ -49,6 +49,9 @@ void _combat_anim_finished();
- int _combat_check_bad_shot(Object* attacker, Object* defender, int hitMode, bool aiming);
- bool _combat_to_hit(Object* target, int* accuracy);
- void _combat_attack_this(Object* target);
-+// The player's attack outside combat is being set up: its animations apply
-+// its damage as in combat.
-+bool combatAttackOutside();
- void _combat_outline_on();
- void _combat_outline_off();
- void _combat_highlight_change();
 diff --git a/src/game.cc b/src/game.cc
 index 978a3859cdf3cb7cbf4c4feffbd203a430afe26b..764ded03a84940c722fabbf6a3099a9b2fd6bfa2 100644
 --- a/src/game.cc

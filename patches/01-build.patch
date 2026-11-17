@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 5e03941804372cfa3acf4626c4d8769afdd38624..3bc158d2406282e204d13c80feca74e3e61b081d 100644
+index 5e03941804372cfa3acf4626c4d8769afdd38624..5f0c7b309038278e5ba281e0dddc1dc25549f4d0 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -16,6 +16,9 @@ endif()
@@ -79,8 +79,8 @@ index 5e03941804372cfa3acf4626c4d8769afdd38624..3bc158d2406282e204d13c80feca74e3
 -    set(MACOSX_BUNDLE_SHORT_VERSION_STRING "1.3.0")
 -    set(MACOSX_BUNDLE_BUNDLE_VERSION "1.3.0")
 +    set(MACOSX_BUNDLE_GUI_IDENTIFIER "com.breakvanilla.wrecked-fallout-2")
-+    set(MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0.1")
-+    set(MACOSX_BUNDLE_BUNDLE_VERSION "1.0.1")
++    set(MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0.2")
++    set(MACOSX_BUNDLE_BUNDLE_VERSION "1.0.2")
  endif()
  
  add_subdirectory("third_party/fpattern")

@@ -15,7 +15,7 @@ mkdir "$OUT"
 PARTS="
 01-build:CMakeLists.txt os
 02-destruct:src/destruct.cc src/destruct.h
-03-game-hooks:src/actions.cc src/animation.cc src/animation.h src/audio_engine.cc src/cache.cc src/combat.cc src/combat.h src/game.cc src/loadsave.cc src/loadsave.h src/map.cc src/object.cc src/sound_effects_cache.h src/svga.cc src/tile.cc src/tile.h
+03-game-hooks:src/actions.cc src/animation.cc src/animation.h src/art.cc src/audio_engine.cc src/cache.cc src/combat.cc src/combat.h src/game.cc src/loadsave.cc src/loadsave.h src/map.cc src/object.cc src/sound_effects_cache.h src/svga.cc src/tile.cc src/tile.h
 04-input-and-platform:src/dinput.cc src/input.cc src/win32.cc src/file_find.cc
 05-test-runs:src/main.cc
 "

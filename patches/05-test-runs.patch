@@ -1,5 +1,5 @@
 diff --git a/src/main.cc b/src/main.cc
-index ee67a0a437476a82e4a9b4483aef5607a8437e3d..b69f933446bf7f67da28e0850a6ede88fceeffb8 100644
+index ee67a0a437476a82e4a9b4483aef5607a8437e3d..b75f7bdac7118449d33e96b68c9fe429dca7e21f 100644
 --- a/src/main.cc
 +++ b/src/main.cc
 @@ -3,21 +3,33 @@
@@ -94,7 +94,7 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..b69f933446bf7f67da28e0850a6ede88
      if (!autorunMutexCreate()) {
          return 1;
      }
-@@ -81,6 +134,424 @@ int falloutMain(int argc, char** argv)
+@@ -81,6 +134,423 @@ int falloutMain(int argc, char** argv)
          return 1;
      }
  
@@ -347,10 +347,6 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..b69f933446bf7f67da28e0850a6ede88
 +        }
 +        // "+offset,+offset,..." or tiles: explosions there one after another,
 +        // each followed by frames in DESTRUCT_TEST_OUT.
-+        // 1: the peaceful setting on, 0: off, whatever wrecked.ini says.
-+        if (getenv("DESTRUCT_TEST_PEACEFUL") != nullptr) {
-+            destructTestSetPeaceful(atoi(getenv("DESTRUCT_TEST_PEACEFUL")) != 0);
-+        }
 +        const char* destructTest = getenv("DESTRUCT_TEST");
 +        if (destructTest != nullptr) {
 +            const char* out = getenv("DESTRUCT_TEST_OUT");
@@ -374,6 +370,7 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..b69f933446bf7f67da28e0850a6ede88
 +                double total = 0.0;
 +                double slowest = 0.0;
 +                int slow = 0;
++                int late = 0;
 +                for (int frame = 0; frame < gap; frame++) {
 +                    Uint64 start = SDL_GetPerformanceCounter();
 +                    inputGetInput();
@@ -383,8 +380,10 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..b69f933446bf7f67da28e0850a6ede88
 +                    total += ms;
 +                    slowest = std::max(slowest, ms);
 +                    slow += ms > 33.0;
++                    // Over 16.7 ms misses a frame at 60 per second.
++                    late += ms > 16.7;
 +                    if (frame + 1 == gap) {
-+                        fprintf(stderr, "destruct: frames %d: average %.1f ms, slowest %.1f ms, over 33 ms %d, particles %d, decals %d\n", frame + 1, total / (frame + 1), slowest, slow, destructTestParticleCount(), destructTestDecalCount());
++                        fprintf(stderr, "destruct: frames %d: average %.1f ms, slowest %.1f ms, over 16.7 ms %d, over 33 ms %d, particles %d, decals %d\n", frame + 1, total / (frame + 1), slowest, late, slow, destructTestParticleCount(), destructTestDecalCount());
 +                    }
 +                    if (out != nullptr && (frame == 2 || frame == 6 || frame == 12 || frame == 20 || frame == 35 || frame == 60 || frame == 149)) {
 +                        char path[512];
@@ -449,7 +448,7 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..b69f933446bf7f67da28e0850a6ede88
 +                    if (count != 0) {
 +                        objectListFree(critters);
 +                    }
-+                    fprintf(stderr, "destruct: peaceful %d, target hp %d, dead %d of %d\n", destructPeaceful(), critterGetHitPoints(target), deadBefore, count);
++                    fprintf(stderr, "destruct: target hp %d, dead %d of %d\n", critterGetHitPoints(target), deadBefore, count);
 +                    for (int shot = 0; shot < shots; shot++) {
 +                        if (click) {
 +                            if (shot != 0 && ammoGetCapacity(weapon) > 0 && ammoGetQuantity(weapon) == 0 && getenv("DESTRUCT_TEST_AMMO") != nullptr && objectCreateWithPid(&ammo, atoi(getenv("DESTRUCT_TEST_AMMO"))) == 0) {
@@ -463,7 +462,7 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..b69f933446bf7f67da28e0850a6ede88
 +                            bool aiming = false;
 +                            interfaceGetCurrentHitMode(&hitMode, &aiming);
 +                            fprintf(stderr, "destruct: shot %d, hit mode %d, bad shot %d\n", shot, hitMode, _combat_check_bad_shot(gDude, target, hitMode, aiming));
-+                            _game_user_wants_to_quit = destructPeaceful() ? 0 : 1;
++                            _game_user_wants_to_quit = 1;
 +                            _combat_attack_this(target);
 +                            fprintf(stderr, "destruct: click at %d (distance %d), in combat %d\n", target->tile, objectGetDistanceBetween(gDude, target), isInCombat());
 +                        } else {
@@ -472,7 +471,7 @@ index ee67a0a437476a82e4a9b4483aef5607a8437e3d..b69f933446bf7f67da28e0850a6ede88
 +                        for (int frame = 0; frame < (getenv("DESTRUCT_TEST_FRAMES") != nullptr ? atoi(getenv("DESTRUCT_TEST_FRAMES")) : 150); frame++) {
 +                            inputGetInput();
 +                            if (click) {
-+                                _game_user_wants_to_quit = destructPeaceful() ? 0 : 1;
++                                _game_user_wants_to_quit = 1;
 +                                scriptsHandleRequests();
 +                            }
 +                            renderPresent();

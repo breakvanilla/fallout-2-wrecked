@@ -1,9 +1,9 @@
 diff --git a/src/destruct.cc b/src/destruct.cc
 new file mode 100644
-index 0000000000000000000000000000000000000000..d222e611147db92f8063a852aa121249fe3f7e9f
+index 0000000000000000000000000000000000000000..79e899a6071f56464f12efd7a49f708b696681c2
 --- /dev/null
 +++ b/src/destruct.cc
-@@ -0,0 +1,4410 @@
+@@ -0,0 +1,4417 @@
 +#include "destruct.h"
 +
 +#include <math.h>
@@ -183,8 +183,6 @@ index 0000000000000000000000000000000000000000..d222e611147db92f8063a852aa121249
 +    bool beam = true;
 +    // G drops a meteor at the cursor.
 +    bool meteor = true;
-+    // Nobody turns on the player and no combat starts.
-+    bool peaceful = false;
 +    int wallStrength = 30;
 +    int sceneryStrength = 10;
 +    // Percent of the usual amount of flying debris.
@@ -407,7 +405,6 @@ index 0000000000000000000000000000000000000000..d222e611147db92f8063a852aa121249
 +        configGetBool(&config, "wrecked", "test_key", &(gDestructConfig.testKey));
 +        configGetBool(&config, "wrecked", "beam", &(gDestructConfig.beam));
 +        configGetBool(&config, "wrecked", "meteor", &(gDestructConfig.meteor));
-+        configGetBool(&config, "wrecked", "peaceful", &(gDestructConfig.peaceful));
 +        configGetInt(&config, "wrecked", "wall_strength", &(gDestructConfig.wallStrength));
 +        configGetInt(&config, "wrecked", "scenery_strength", &(gDestructConfig.sceneryStrength));
 +        configGetInt(&config, "wrecked", "debris", &(gDestructConfig.debris));
@@ -966,27 +963,33 @@ index 0000000000000000000000000000000000000000..d222e611147db92f8063a852aa121249
 +}
 +
 +// A puff's shade and coverage between its pixels, so that it grows smoothly.
-+static void destructSample(const DestructSprite* sprite, int frame, float x, float y, int* shade, int* alpha)
++// Where a row or column of the screen samples a scaled sprite: the two
++// source pixels and the weight of the second, out of 256. Worked out once per
++// row and column, not for every pixel.
++typedef struct SampleStep {
++    int first;
++    int second;
++    int weight;
++} SampleStep;
++
++static void destructSampleSteps(int from, int to, int origin, int size, int spriteSize, int stride, std::vector<SampleStep>* steps)
 +{
-+    x = std::clamp(x - 0.5f, 0.0f, sprite->width - 1.001f);
-+    y = std::clamp(y - 0.5f, 0.0f, sprite->height - 1.001f);
-+    int left = (int)x;
-+    int top = (int)y;
-+    int right = std::min(left + 1, sprite->width - 1);
-+    int bottom = std::min(top + 1, sprite->height - 1);
-+    float fx = x - left;
-+    float fy = y - top;
-+    const unsigned char* a = sprite->pixel(frame, left, top);
-+    const unsigned char* b = sprite->pixel(frame, right, top);
-+    const unsigned char* c = sprite->pixel(frame, left, bottom);
-+    const unsigned char* d = sprite->pixel(frame, right, bottom);
-+    int last = sprite->channels - 1;
-+    float wa = (1 - fx) * (1 - fy);
-+    float wb = fx * (1 - fy);
-+    float wc = (1 - fx) * fy;
-+    float wd = fx * fy;
-+    *shade = (int)(a[0] * wa + b[0] * wb + c[0] * wc + d[0] * wd);
-+    *alpha = (int)(a[last] * wa + b[last] * wb + c[last] * wc + d[last] * wd);
++    steps->resize(to - from + 1);
++    for (int position = from; position <= to; position++) {
++        float source = std::clamp((position - origin + 0.5f) * spriteSize / size - 0.5f, 0.0f, spriteSize - 1.001f);
++        int first = (int)source;
++        SampleStep& step = (*steps)[position - from];
++        step.first = first * stride;
++        step.second = std::min(first + 1, spriteSize - 1) * stride;
++        step.weight = (int)((source - first) * 256.0f);
++    }
++}
++
++static inline int destructBilinear(int a, int b, int c, int d, int weightX, int weightY)
++{
++    int top = a * (256 - weightX) + b * weightX;
++    int bottom = c * (256 - weightX) + d * weightX;
++    return (top * (256 - weightY) + bottom * weightY) >> 16;
 +}
 +
 +static void destructDrawParticle(const Particle& particle, Rect* rect, int light)
@@ -1059,18 +1062,26 @@ index 0000000000000000000000000000000000000000..d222e611147db92f8063a852aa121249
 +        float heat = 1.0f - particle.age / particle.life;
 +        float fade = std::min(1.0f, 2.2f * heat);
 +        const unsigned char* ramp = gDestructRamp[particle.blast];
++        int last = sprite->channels - 1;
++        static std::vector<SampleStep> columns;
++        static std::vector<SampleStep> rows;
++        destructSampleSteps(clipped.left, clipped.right, particleRect.left, width, sprite->width, sprite->channels, &columns);
++        destructSampleSteps(clipped.top, clipped.bottom, particleRect.top, height, sprite->height, sprite->width * sprite->channels, &rows);
++        const unsigned char* pixels = sprite->pixel(particle.frame, 0, 0);
++        int fadeScale = (int)(fade * 256.0f);
 +        for (int y = clipped.top; y <= clipped.bottom; y++) {
 +            unsigned char* dest = gDestructBuffer + y * gDestructPitch;
-+            float sourceY = (y - particleRect.top + 0.5f) * sprite->height / height;
++            const SampleStep& row = rows[y - clipped.top];
++            const unsigned char* top = pixels + row.first;
++            const unsigned char* bottom = pixels + row.second;
 +            for (int x = clipped.left; x <= clipped.right; x++) {
-+                float sourceX = (x - particleRect.left + 0.5f) * sprite->width / width;
-+                int shade;
-+                int alpha;
-+                destructSample(sprite, particle.frame, sourceX, sourceY, &shade, &alpha);
-+                alpha = (int)(alpha * fade);
++                const SampleStep& column = columns[x - clipped.left];
++                int alpha = destructBilinear(top[column.first + last], top[column.second + last], bottom[column.first + last], bottom[column.second + last], column.weight, row.weight);
++                alpha = alpha * fadeScale >> 8;
 +                if (alpha <= 8) {
 +                    continue;
 +                }
++                int shade = destructBilinear(top[column.first], top[column.second], bottom[column.first], bottom[column.second], column.weight, row.weight);
 +                float glow = std::clamp(heat * (0.35f + 0.9f * shade / 255.0f), 0.0f, 1.0f);
 +                unsigned char color = ramp[(int)(glow * 31.0f)];
 +                if (alpha >= 200) {
@@ -1082,10 +1093,9 @@ index 0000000000000000000000000000000000000000..d222e611147db92f8063a852aa121249
 +                int g;
 +                int b;
 +                destructColorRgb(color, &r, &g, &b);
-+                int under = Color2RGB(dest[x]);
-+                int underR = ((under >> 10) & 0x1F) * 8;
-+                int underG = ((under >> 5) & 0x1F) * 8;
-+                int underB = (under & 0x1F) * 8;
++                int underR = (_cmap[dest[x] * 3] >> 1) * 8;
++                int underG = (_cmap[dest[x] * 3 + 1] >> 1) * 8;
++                int underB = (_cmap[dest[x] * 3 + 2] >> 1) * 8;
 +                dest[x] = destructColor(underR + (r - underR) * alpha / 200,
 +                    underG + (g - underG) * alpha / 200,
 +                    underB + (b - underB) * alpha / 200);
@@ -1109,26 +1119,32 @@ index 0000000000000000000000000000000000000000..d222e611147db92f8063a852aa121249
 +        destructColorRgb(particle.color, &baseR, &baseG, &baseB);
 +        // Smoke takes the light of where it is.
 +        int lightScale = std::max(light, 40);
++        int last = sprite->channels - 1;
++        static std::vector<SampleStep> columns;
++        static std::vector<SampleStep> rows;
++        destructSampleSteps(clipped.left, clipped.right, particleRect.left, width, sprite->width, sprite->channels, &columns);
++        destructSampleSteps(clipped.top, clipped.bottom, particleRect.top, height, sprite->height, sprite->width * sprite->channels, &rows);
++        const unsigned char* pixels = sprite->pixel(particle.frame, 0, 0);
 +        for (int y = clipped.top; y <= clipped.bottom; y++) {
 +            unsigned char* dest = gDestructBuffer + y * gDestructPitch;
-+            float sourceY = (y - particleRect.top + 0.5f) * sprite->height / height;
++            const SampleStep& row = rows[y - clipped.top];
++            const unsigned char* top = pixels + row.first;
++            const unsigned char* bottom = pixels + row.second;
 +            for (int x = clipped.left; x <= clipped.right; x++) {
-+                float sourceX = (x - particleRect.left + 0.5f) * sprite->width / width;
-+                int shade;
-+                int alpha;
-+                destructSample(sprite, particle.frame, sourceX, sourceY, &shade, &alpha);
++                const SampleStep& column = columns[x - clipped.left];
++                int alpha = destructBilinear(top[column.first + last], top[column.second + last], bottom[column.first + last], bottom[column.second + last], column.weight, row.weight);
 +                alpha = alpha * opacity >> 8;
 +                if (alpha <= 4) {
 +                    continue;
 +                }
++                int shade = destructBilinear(top[column.first], top[column.second], bottom[column.first], bottom[column.second], column.weight, row.weight);
 +                shade = (90 + shade) * lightScale / 128;
 +                int r = baseR * shade >> 8;
 +                int g = baseG * shade >> 8;
 +                int b = baseB * shade >> 8;
-+                int under = Color2RGB(dest[x]);
-+                int underR = ((under >> 10) & 0x1F) * 8;
-+                int underG = ((under >> 5) & 0x1F) * 8;
-+                int underB = (under & 0x1F) * 8;
++                int underR = (_cmap[dest[x] * 3] >> 1) * 8;
++                int underG = (_cmap[dest[x] * 3 + 1] >> 1) * 8;
++                int underB = (_cmap[dest[x] * 3 + 2] >> 1) * 8;
 +                dest[x] = destructColor(underR + (r - underR) * alpha / 255,
 +                    underG + (g - underG) * alpha / 255,
 +                    underB + (b - underB) * alpha / 255);
@@ -4322,17 +4338,8 @@ index 0000000000000000000000000000000000000000..d222e611147db92f8063a852aa121249
 +    fileClose(stream);
 +}
 +
-+bool destructPeaceful()
-+{
-+    return gDestructConfig.enabled && gDestructConfig.peaceful;
-+}
 +
 +#ifdef WRECKED_TEST
-+void destructTestSetPeaceful(bool peaceful)
-+{
-+    gDestructConfig.peaceful = peaceful;
-+}
-+
 +bool destructTestSnapshot(const char* path)
 +{
 +    if (gDestructBuffer == nullptr) {
@@ -4416,10 +4423,10 @@ index 0000000000000000000000000000000000000000..d222e611147db92f8063a852aa121249
 +} // namespace fallout
 diff --git a/src/destruct.h b/src/destruct.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..7ddf81883954ed07af7e94403f009b67efc9f053
+index 0000000000000000000000000000000000000000..0cd195e58c3eac263c098d995fb42b78cf86b2db
 --- /dev/null
 +++ b/src/destruct.h
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,76 @@
 +#ifndef FALLOUT_DESTRUCT_H_
 +#define FALLOUT_DESTRUCT_H_
 +
@@ -4486,11 +4493,7 @@ index 0000000000000000000000000000000000000000..7ddf81883954ed07af7e94403f009b67
 +// How far the presented screen is shaken, in screen pixels.
 +void destructShakeOffset(int* x, int* y);
 +
-+// No combat starts and the player's attacks run in real time.
-+bool destructPeaceful();
-+
 +#ifdef WRECKED_TEST
-+void destructTestSetPeaceful(bool peaceful);
 +bool destructTestSnapshot(const char* path);
 +int destructTestDecalCount();
 +int destructTestParticleCount();
